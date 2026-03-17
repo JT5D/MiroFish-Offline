@@ -63,11 +63,25 @@ mirofish_graph_search(graph_id="<graph_id>", query="<key entity>")
 mirofish_run_pipeline(project_id="<project_id>", platform="parallel", max_rounds=10)
 ```
 
-### 7. Generate Report (Optional)
+### 7. Generate Report & Extract Insights
+
+After simulation completes:
 
 ```
 mirofish_generate_report(simulation_id="<sim_id>")
 ```
+
+Retrieve with `mirofish_get_report(simulation_id)`.
+
+**Auto-promote insights from the report using the Insight Promotion Pyramid:**
+
+- **T1 (Insights)**: Extract key findings from the report and append to `~/.claude/knowledgebase/_MIROFISH_SIMULATION_INSIGHTS.md`. This file is readable by both MiroFish and portals_v4 sessions via the shared KB symlink. Include both positive patterns ("agents with richer graph context produce 3x more differentiated posts") and negative patterns ("generic bios correlate with flat engagement curves").
+
+- **T2 (Massive Wins)**: If a finding changes how development should be done across projects (e.g., "voice commands drive 40% of user engagement — prioritize voice UX"), add it to the relevant project's `CLAUDE.md` or `~/GLOBAL_RULES.md`.
+
+- **T3 (Quantum Leaps)**: If a finding reveals a violation class that should never happen again, add automated enforcement (git hook, pre-commit, CI check).
+
+**Inverse rule applies equally**: anti-patterns, failures, and "never do X" discoveries get the same tiered treatment. A simulation that produces flat agents = T1 note. Recurring flat agents across enrichment cycles = T2 "always verify graph density before simulating" rule. Catastrophic context truncation = T3 pre-simulation hook that checks graph node count.
 
 ## Zero-Token Automation
 
@@ -75,10 +89,10 @@ The portals_v4 post-commit hook (`portals_v4/.git/hooks/post-commit`) automatica
 1. `~/.mirofish_active_graph_id` file exists (set by step 1 above)
 2. MiroFish backend is running on localhost:5001
 
-This means every portals_v4 commit enriches the graph with zero Claude tokens. The hook is fire-and-forget (non-blocking, backgrounded with `&`). `/sim-update` is only needed for manual enrichment, re-simulation, or report generation.
+This means every portals_v4 commit enriches the graph with zero Claude tokens. The hook is fire-and-forget (non-blocking, backgrounded with `&`), silent when MiroFish is unavailable.
 
 ## Notes
 
 - Each enrichment compounds — entities merge via MERGE semantics in Neo4j
 - Multiple sources can be enriched in sequence within one run
-- The git hook is non-blocking — it backgrounds the curl and never delays commits
+- Insights flow bidirectionally: portals_v4 commits → MiroFish graph → simulation → report insights → KB → portals_v4 reads KB
