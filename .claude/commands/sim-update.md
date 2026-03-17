@@ -14,6 +14,12 @@ Closed-loop feedback: gather signals → summarize into domain prose → enrich 
 Use `mirofish_list_projects` to find the project. Note the `graph_id` and `project_id`.
 If the user specified a project, use that one. Otherwise, use the most recent project with a completed graph.
 
+**After identifying the graph, persist it for the zero-token git hook:**
+```bash
+echo "<graph_id>" > ~/.mirofish_active_graph_id
+```
+This enables the portals_v4 post-commit hook to automatically enrich on every commit (zero Claude tokens).
+
 ### 2. Gather Signals
 
 Ask the user which sources to pull from. Multiple sources can be combined in one run.
@@ -21,97 +27,58 @@ Ask the user which sources to pull from. Multiple sources can be combined in one
 | Source | How to gather |
 |--------|---------------|
 | **portals_v4 git changes** | `git -C ~/Documents/GitHub/portals_v4 log --oneline --since="7d"` and `git -C ~/Documents/GitHub/portals_v4 diff HEAD~10..HEAD --stat` then read key changed files |
-| **Voice prompts** | Read `VoiceIntentManager.cs` or voice-related source files from portals_v4 |
-| **Worlds saved** | Read scene persistence code, saved world metadata from portals_v4 |
-| **Features most used** | Read analytics events, UI interaction patterns from portals_v4 |
-| **Build/test results** | Run `dotnet test` or read recent CI/build output |
-| **Performance metrics** | Read profiler data, frame time budgets from portals_v4 code |
 | **Dev input** | Developer provides feedback directly in conversation |
 | **User feedback** | User describes simulation quality issues or persona adjustments |
 | **KB learnings** | Read `~/.claude/knowledgebase/_MIROFISH_AGENT_SIMULATION_PATTERNS.md` |
-| **CVPR paper** | Read portals 4D world models paper for architectural principles |
 
 ### 3. Summarize into Domain Prose
 
 **Critical step.** Do NOT feed raw diffs, code, or logs into the graph. Summarize each signal source into NER-friendly domain-knowledge paragraphs.
 
 Good example:
-> "Portals now supports AR scene recording via ArViewRecorder, capturing at 30 FPS using AVAssetWriter. Users can scrub recorded clips for cover frames and publish directly to social feeds. The recording pipeline integrates with the existing VFX system."
+> "Portals now supports AR scene recording via ArViewRecorder, capturing at 30 FPS using AVAssetWriter. Users can scrub recorded clips for cover frames and publish directly to social feeds."
 
 Bad example:
 > "Added ArViewRecorder.cs with StartRecording() and StopRecording() methods. Uses AVAssetWriter..."
 
-The summary should:
-- Name technologies, features, people, organizations as proper nouns (NER targets)
-- Describe relationships between entities ("integrates with", "publishes to", "captures")
-- Use complete sentences, not bullet lists
-- Focus on what users/agents would know, not implementation details
+The summary should name entities as proper nouns, describe relationships, use complete sentences, focus on domain knowledge not implementation.
 
 ### 4. Enrich the Graph
 
-Call the MCP tool to feed summarized text into the graph:
-
 ```
-mirofish_enrich_graph(
-  graph_id="<graph_id>",
-  text="<summarized paragraphs>",
-  source="<source_label>"  // e.g. "portals_v4_commits", "dev_input", "user_feedback"
-)
+mirofish_enrich_graph(graph_id="<graph_id>", text="<prose>", source="<label>")
 ```
 
-This returns a `task_id`. Poll with `mirofish_task_status(task_id)` until complete.
+Poll with `mirofish_task_status(task_id)` until complete.
 
 ### 5. Verify Enrichment
 
-Search the graph to confirm new entities were added:
-
 ```
-mirofish_graph_search(
-  graph_id="<graph_id>",
-  query="<key entity from your summary>"
-)
+mirofish_graph_search(graph_id="<graph_id>", query="<key entity>")
 ```
-
-Report what new entities and relations appeared.
 
 ### 6. Re-simulate (Optional)
-
-If the user wants to see improved agents, re-run the simulation:
 
 ```
 mirofish_run_pipeline(project_id="<project_id>", platform="parallel", max_rounds=10)
 ```
 
-The profile generator will now draw from the enriched graph, producing agents with richer context.
-
-### 7. Generate Comparative Report (Optional)
-
-After simulation completes:
+### 7. Generate Report (Optional)
 
 ```
-mirofish_generate_report(simulation_id="<new_sim_id>")
+mirofish_generate_report(simulation_id="<sim_id>")
 ```
 
-Then retrieve with `mirofish_get_report(simulation_id)` and compare against previous reports.
+## Zero-Token Automation
 
-## Example Workflow
+The portals_v4 post-commit hook (`portals_v4/.git/hooks/post-commit`) automatically POSTs commit messages to `/api/graph/enrich` when:
+1. `~/.mirofish_active_graph_id` file exists (set by step 1 above)
+2. MiroFish backend is running on localhost:5001
 
-```
-User: /sim-update
-Claude: Which sources should I pull from?
-User: portals_v4 commits and dev input
-Claude: [reads git log, summarizes changes into prose]
-Claude: [calls mirofish_enrich_graph with summary]
-Claude: [verifies with mirofish_graph_search]
-Claude: Graph enriched with 12 new entities. Want me to re-run the simulation?
-User: Yes
-Claude: [calls mirofish_run_pipeline]
-Claude: Simulation complete. Agents now reference AR recording and VFX features.
-```
+This means every portals_v4 commit enriches the graph with zero Claude tokens. The hook is fire-and-forget (non-blocking, backgrounded with `&`). `/sim-update` is only needed for manual enrichment, re-simulation, or report generation.
 
 ## Notes
 
-- Each enrichment compounds — entities merge with existing ones via MERGE semantics in Neo4j
-- The `source` label is stored for audit trail, not used in NER
-- Multiple sources can be enriched in sequence within one `/sim-update` run
-- If enrichment task fails, check that the graph_id exists and Neo4j is running
+- Each enrichment compounds — entities merge via MERGE semantics in Neo4j
+- Multiple sources can be enriched in sequence within one run
+- The git hook is non-blocking — it backgrounds the curl and never delays commits
