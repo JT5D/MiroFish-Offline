@@ -133,6 +133,14 @@ Located in `tools/` directory — each module is standalone and can be copied to
 | `llm_agent.py` | Base class + stepwise orchestrator for LLM agents | `llm_client`, `json_repair` |
 | `batch_processor.py` | Parallel batch processing with per-item isolation | stdlib only |
 
+### Process Management (cross-platform)
+
+| Module | Purpose | Dependencies |
+|--------|---------|-------------|
+| `subprocess_manager.py` | Cross-platform process spawning, monitoring, and cleanup | stdlib only |
+| `streaming_log_reader.py` | Incremental JSONL log reader with event dispatch | stdlib only |
+| `react_agent.py` | ReACT loop with tool calling (Thought → Tool → Observation → Answer) | `llm_client`, `json_repair` |
+
 ### How They Compose
 
 ```
@@ -145,6 +153,14 @@ batch_processor.py ──→ (runs many LLMAgent.run() calls in parallel)
 task_manager.py ─────→ (tracks overall progress of batch operations)
                       │
 retry.py ────────────→ (wraps external API calls with backoff)
+
+subprocess_manager.py ──→ (spawns long-running processes)
+                            │
+streaming_log_reader.py ───→ (reads JSONL output from subprocess)
+                            │
+react_agent.py ──→ llm_client.py (LLM calls for reasoning)
+                      │
+                   json_repair.py (parse tool call JSON)
 ```
 
 ### Usage Example: Building a New LLM Agent
@@ -214,6 +230,31 @@ When LLM-generated configs reference entity types, they may use synonyms or diff
 ```
 This prevents brittle exact-match failures. Fallback: pick the agent with the highest influence weight.
 
+## Claude Code Project Commands
+
+Located in `.claude/commands/` (gitignored, local-only). These are slash commands usable in Claude Code sessions:
+
+| Command | Purpose |
+|---------|---------|
+| `/start` | Start all MiroFish services (Ollama, Docker/Neo4j, backend, frontend) |
+| `/sim` | Create, prepare, and run a simulation from an existing project |
+| `/status` | Quick health check of all services |
+| `/stop` | Gracefully shut down all services |
+| `/wrap-up` | End-of-session routine: review changes, update knowledgebase, commit, push |
+
+`CLAUDE.md` at project root provides Claude Code with project context (ports, URLs, conventions, resource constraints).
+
+## Deep Patterns: Process Management
+
+### Pattern: Cross-Platform Process Groups
+`SubprocessManager` spawns subprocesses in their own process group (Unix: `start_new_session=True`, Windows: `CREATE_NEW_PROCESS_GROUP`). This ensures `kill_process()` can terminate the entire process tree, not just the parent. The manager registers an `atexit` handler and signal handlers (SIGTERM, SIGINT) to clean up all spawned processes on exit.
+
+### Pattern: Graceful Termination with Escalation
+When stopping a subprocess, the manager sends SIGTERM first and waits a configurable timeout. If the process doesn't exit, it escalates to SIGKILL. This mirrors how the simulation runner terminates OASIS subprocesses.
+
+### Pattern: Byte-Position Log Tracking
+`StreamingLogReader` tracks the file read position in bytes (not lines), enabling efficient incremental reads of growing log files. Each `poll()` call reads only new bytes since the last read, parses complete JSON lines, and dispatches events by type. Incomplete lines (no trailing newline) are buffered for the next poll.
+
 ## Lessons Learned
 
 1. **Ollama num_ctx is critical** — without explicitly setting it, prompts get silently truncated at 2048 tokens. Always pass `num_ctx` via extra_body.
@@ -226,3 +267,6 @@ This prevents brittle exact-match failures. Fallback: pick the agent with the hi
 8. **Always have a rule-based fallback per entity type** — LLMs are unreliable for 100% of items. Rule-based defaults (based on entity type lookup tables) ensure the pipeline never stalls.
 9. **Real-time file output during generation** gives users confidence the system is working — write results incrementally, not just at the end.
 10. **Pre-allocate result lists for order preservation** — when using ThreadPoolExecutor with as_completed(), items return out of order. Pre-allocating `[None] * total` and writing by index preserves input ordering.
+11. **Always use process groups for subprocesses** — without `start_new_session`, killing the parent leaves orphan child processes consuming resources. Process groups enable clean tree termination.
+12. **Byte-position tracking beats line counting for streaming logs** — seeking to a byte offset is O(1) vs re-reading and counting lines which is O(n). Critical for long-running simulations that produce thousands of log entries.
+13. **ReACT loops need iteration caps and tool timeouts** — without them, an LLM can loop indefinitely or a misbehaving tool can block forever. Always set `max_iterations` and per-tool `timeout` as safety bounds.

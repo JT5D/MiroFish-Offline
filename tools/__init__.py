@@ -16,4 +16,9 @@ Agent patterns:
     json_repair     — Multi-stage LLM JSON output repair (truncation, fences, corruption)
     llm_agent       — Base class for LLM-backed agents (prompt → call → parse → fallback)
     batch_processor — Parallel batch processing with per-item isolation + progress
+    react_agent     — ReACT loop with tool calling (Thought → Tool → Observation → Answer)
+
+Process management:
+    subprocess_manager   — Cross-platform process spawning, monitoring, and cleanup
+    streaming_log_reader — Incremental JSONL log reader with event dispatch
 """
