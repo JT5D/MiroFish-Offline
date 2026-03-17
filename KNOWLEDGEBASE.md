@@ -255,6 +255,120 @@ When stopping a subprocess, the manager sends SIGTERM first and waits a configur
 ### Pattern: Byte-Position Log Tracking
 `StreamingLogReader` tracks the file read position in bytes (not lines), enabling efficient incremental reads of growing log files. Each `poll()` call reads only new bytes since the last read, parses complete JSON lines, and dispatches events by type. Incomplete lines (no trailing newline) are buffered for the next poll.
 
+---
+
+## Higher-Level Learnings
+
+Strategic and conceptual insights that transfer beyond this codebase.
+
+### Document-to-Knowledge Pipelines
+
+**Generate ontologies from source material, don't predefine them.** MiroFish uses an LLM to read the uploaded documents and design the entity/relationship schema on the fly. This ensures the graph structure matches the actual domain rather than forcing content into a generic model. The constraint: cap entity types at ~10 (8 domain + 2 fallbacks: Person, Organization) to prevent schema explosion while keeping flexibility.
+
+**Fallback types are essential.** Real documents always contain outlier entities (unnamed groups, passing references, anonymous actors). Rather than discarding them or forcing them into domain types, two generic fallback types (Person, Organization) catch anything the domain types miss. This pattern applies to any pipeline that classifies input into categories.
+
+**Chunks are a pipeline stage, not an optimization.** Splitting text into overlapping chunks (500 chars, 50 overlap) before NER isn't about fitting token limits — it's about creating manageable extraction units while preserving cross-boundary relationships via overlap.
+
+**Store ontology as metadata, not compiled code.** Rather than generating Pydantic classes from the ontology (the original design), MiroFish stores it as JSON in Neo4j. This eliminates code generation, supports schema evolution without restarts, and separates "what types exist" from "how data is stored."
+
+### Graph Database Design (Neo4j)
+
+**Use node labels as the ontology enforcement layer.** Entity types become Neo4j labels directly. `get_nodes_by_label(graph_id, "Student")` is the primary filtering pattern. This makes the graph self-documenting — querying for labels reveals what types exist without consulting a separate schema.
+
+**Encode temporal validity on edges.** Every relationship carries `valid_at`, `invalid_at`, and `expired_at` timestamps. This creates a temporal knowledge graph where facts can expire naturally (a temporary alliance) or be invalidated (a court ruling). Query tools distinguish "active facts" from "historical facts," enabling both current-state queries and evolution narratives.
+
+**Hybrid search (vector + BM25) with tiered depth.** Three search strategies serve different needs:
+1. **QuickSearch** — single vector+BM25 query, fast, for simple factual retrieval
+2. **PanoramaSearch** — exhaustive, includes expired/historical edges, for full-picture analysis
+3. **InsightForge** — LLM decomposes the question into sub-queries, executes each, aggregates results. Slower but handles complex analytical questions that a single search can't answer.
+
+The key insight: **use the LLM as a question decomposer, not a question answerer.** Don't ask the LLM to reason over a large knowledge base. Ask it to break the question into searchable sub-questions, search for each, then integrate.
+
+**Graphs beat relational when relationships are the data.** Social networks, influence flows, entity-to-entity interactions — these are naturally graph-shaped. The ability to traverse 2-3 hops (entity → relationship → related entity → their relationships) in a single Cypher query would require multiple JOINs in SQL.
+
+### Multi-Agent Simulation Design
+
+**Entities ≠ Agents.** A graph entity (e.g., "Professor Chen") is raw data. An Agent is a behavioral projection of that entity: same identity, but with added personality parameters (MBTI, activity level, sentiment bias) and temporal patterns (active hours, response delay). The separation matters because one entity can theoretically produce different agents under different simulation configurations.
+
+**Dual persona types for realism.** Individual entities (students, professors) get generated age, gender, MBTI, personal voice, catchphrases, and social media behavior patterns. Group entities (universities, government agencies) get fixed demographics (age=30, gender="other") but MBTI becomes an institutional voice descriptor (e.g., ISTJ = rigorous, conservative). This duality ensures both humans and organizations behave authentically.
+
+**Parameterize behavior along independent axes:**
+- **Temporal**: active_hours (when they appear), response_delay (how fast they react)
+- **Frequency**: posts_per_hour, comments_per_hour, scaled by activity_level
+- **Sentiment**: sentiment_bias (−1.0 to +1.0, pessimistic to optimistic lean)
+- **Stance**: supportive / opposing / neutral / observer
+- **Influence**: influence_weight (reach probability)
+
+These parameters are generated by LLM based on entity type and scenario context, not hardcoded. The system provides baseline ranges per type (officials: 0.1–0.3 activity, media: 0.4–0.6, individuals: 0.6–0.9), and the LLM fills in specifics.
+
+**Time configuration encodes real-world patterns.** Hour-by-hour activity multipliers (dead hours 0-5AM: 0.05×, evening peak 19-22: 1.5×) are built-in domain knowledge that makes simulations feel realistic without agents needing to "learn" daily patterns.
+
+**Platform-specific behavior tuning.** The same agent behaves differently on Twitter vs Reddit:
+- Twitter: higher recency weight (0.4), lower viral threshold (10 interactions)
+- Reddit: higher popularity weight (0.4), stronger echo chamber (0.6)
+
+This captures the structural differences between platforms without requiring separate agent models.
+
+**Seed simulations with typed initial posts.** Generated "initial posts" each specify a poster_type (official, media, student), which gets matched to an appropriate agent. Officials publish official statements, media publish news reports, students publish opinions. Type alias mapping handles LLM-generated synonyms ("media" → "mediaoutlet"). Fallback: highest-influence agent.
+
+### LLM Orchestration at Scale
+
+**Asymmetric confidence in LLM outputs.** Trust LLMs for creative, open-ended tasks (persona generation, report writing, question decomposition). Be skeptical for deterministic tasks (config generation, ontology creation). Example: a persona "bio" field has no validation; a config "agents_per_hour_max" field is validated against entity count.
+
+**Three-layer fallback for every LLM call:**
+1. LLM call with structured JSON response
+2. JSON repair (fix truncation, extract partial data)
+3. Rule-based generation (hardcoded sensible defaults per entity type)
+
+No LLM call in the system is a single point of failure.
+
+**Temperature separates creative from deterministic tasks.** Creative tasks (persona generation) use temperature 0.7. Deterministic tasks (ontology, config, report) use 0.3. Within a single agent's retry loop, temperature decreases per attempt (0.7 → 0.6 → 0.5) to progressively favor validity over creativity.
+
+**Truncate context upstream, don't hope the LLM ignores it.** Each pipeline step has an explicit context budget (ontology: 50k chars, time config: 10k, events: 8k, entity summaries: 300 each). Context is assembled in priority order (direct relationships first, then search results, then bulk text) and truncated at the budget. The most specific context is never lost; bulk text gets cut first.
+
+**Batch heterogeneous items to amortize context overhead.** With 100+ entities, generating configs one-by-one wastes tokens repeating the scenario context. Instead, batch 15 entities per LLM call. Each call includes the full simulation context but only its batch of entities. This is 6-7× more token-efficient than individual calls.
+
+### Report Generation (ReACT Agents in Practice)
+
+**Two-phase report generation: plan then execute.** Phase 1: LLM generates a report outline (sections, questions each section should answer). Phase 2: for each section, enter a ReACT loop — thought → tool selection → tool call → observation → next thought → answer.
+
+**Tool selection by complexity.** The report agent has access to QuickSearch, PanoramaSearch, and InsightForge. It self-selects based on question complexity. Simple factual queries use QuickSearch. Evolution/trend questions use PanoramaSearch. Root-cause analysis uses InsightForge. The agent learns which tool fits by including tool descriptions in its system prompt.
+
+**Agent interviews as simulation introspection.** The report agent can call `interview_agents()` to ask simulated agents questions directly. Agents respond based on their persona and action history. This creates multi-perspective reports where the same event is narrated by agents with different viewpoints. It's a form of qualitative data collection from the simulation.
+
+**Facts as citation units.** The report system distinguishes graph-sourced facts (marked for verbatim citation) from LLM-generated reasoning. This creates an implicit citation protocol where readers can trace claims to their data source.
+
+**Full audit trail via JSONL logging.** Every ReACT iteration — tool calls, tool results, reasoning steps, section completions — is logged to a JSONL file. The report generation process is fully reproducible and auditable.
+
+### Simulation as Knowledge Refinement
+
+**The closed-loop feedback cycle:**
+```
+Documents → Graph → Agent Profiles → Simulation → Graph Updates → Richer Reports
+                                         ↑                            │
+                                         └────────────────────────────┘
+```
+
+Simulation actions (posts, likes, follows) are converted to natural language and fed back into the NER pipeline via GraphMemoryUpdater. The graph becomes richer and more detailed as simulations run. Subsequent reports draw on simulation-enriched knowledge, not just the original documents.
+
+**Information fidelity through layers:**
+1. Documents — raw text with full context
+2. Ontology — domain schema extracted via LLM
+3. Graph — entities and relationships with temporal metadata
+4. Agents — behavioral parameters derived from graph entities
+5. Simulation — agent interactions and emergent behaviors
+6. Reports — analytical synthesis via ReACT tool use
+
+Each layer adds abstraction but preserves traceability back to its source.
+
+### Architecture-Level Principles
+
+**Domain knowledge lives in both code and metadata.** Hardcoded: daily activity schedules, entity type defaults, platform algorithms. Metadata: ontology types, agent behavioral parameters, time multipliers. The hybrid ensures flexibility (metadata can change without deploys) while remaining grounded (code enforces invariants).
+
+**Subprocess isolation for unreliable workloads.** Simulations run in separate Python processes, not in the Flask server. IPC happens via filesystem (command/response files). A crashed simulation doesn't crash the backend. Status is tracked via real-time log reading, not in-process state.
+
+**Graceful degradation everywhere.** If graph search fails → local keyword matching. If LLM fails → rule-based generation. If interview fails → helpful error message. If graph update fails → retry 3× with backoff. No component has a hard failure mode.
+
 ## Lessons Learned
 
 1. **Ollama num_ctx is critical** — without explicitly setting it, prompts get silently truncated at 2048 tokens. Always pass `num_ctx` via extra_body.
