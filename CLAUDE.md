@@ -15,6 +15,7 @@ Local-first social media simulation platform. Neo4j + Ollama + Flask + Vue.
 - `/start` — Start all services (Ollama, Neo4j, backend, frontend)
 - `/status` — Health check all services
 - `/sim` — Create and run a simulation
+- `/sim-update` — Enrich graph from external signals, re-simulate (closed-loop feedback)
 - `/stop` — Gracefully stop all services
 - `/wrap-up` — End-of-session: update knowledgebase, commit, push
 
@@ -55,7 +56,7 @@ tools/            # Extracted reusable toolkit (see KNOWLEDGEBASE.md)
 - **Start simple.** Minimal working version first. Add complexity only when needed.
 - **On 529/overloaded/500 from Anthropic: skip and continue.** Retry once after 1s. If it fails again, skip entirely and move on. Never block progress on upstream API instability.
 - **Anthropic errors are not local bugs.** Errors with `request_id: "req_..."` are server-side. Don't debug local code for them. Skip and continue.
-- **MCP server**: `mcp-server/server.py` — 9 tools, lifespan-managed httpx client. Add tools sparingly.
+- **MCP server**: `mcp-server/server.py` — 13 tools, lifespan-managed httpx client. Add tools sparingly.
 
 ## Key Files
 

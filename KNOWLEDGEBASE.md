@@ -241,6 +241,7 @@ Located in `.claude/commands/` (gitignored, local-only). These are slash command
 | `/status` | Quick health check of all services |
 | `/stop` | Gracefully shut down all services |
 | `/wrap-up` | End-of-session routine: review changes, update knowledgebase, commit, push |
+| `/sim-update` | Enrich graph from external signals (code changes, dev input, user feedback), optionally re-simulate |
 
 `CLAUDE.md` at project root provides Claude Code with project context (ports, URLs, conventions, resource constraints).
 
@@ -350,6 +351,16 @@ Documents → Graph → Agent Profiles → Simulation → Graph Updates → Rich
 ```
 
 Simulation actions (posts, likes, follows) are converted to natural language and fed back into the NER pipeline via GraphMemoryUpdater. The graph becomes richer and more detailed as simulations run. Subsequent reports draw on simulation-enriched knowledge, not just the original documents.
+
+**External enrichment via `/api/graph/enrich`:**
+Beyond in-simulation graph updates, the graph can be enriched from external sources between simulation runs. The `POST /api/graph/enrich` endpoint accepts prose text + graph_id, chunks it, and runs it through the existing NER pipeline (`storage.add_text()`). This enables a multi-source feedback loop:
+
+- **Code changes** (portals_v4 git diffs → summarized as domain prose)
+- **Developer input** (corrections, design decisions, stakeholder updates)
+- **User feedback** (persona adjustments, missing behaviors, quality observations)
+- **KB learnings** (architectural patterns, cross-project connections)
+
+Claude Code serves as the orchestrator — it reads raw signals, summarizes them into NER-friendly paragraphs, and feeds them through the MCP tool `mirofish_enrich_graph`. The `/sim-update` slash command orchestrates this workflow end-to-end. This implements the CVPR paper's closed-loop refinement pattern at the simulation level: capture → reconstruct (graph enrichment) → compose (agent profiles) → share (simulation) → refine (report → next cycle).
 
 **Information fidelity through layers:**
 1. Documents — raw text with full context
