@@ -309,6 +309,30 @@ class SimulationRunner:
         cls._run_states[state.simulation_id] = state
 
     @classmethod
+    def _sync_simulation_state(cls, simulation_id: str, run_state: SimulationRunState):
+        """Sync runner status back to state.json so UI and API see the correct status."""
+        state_file = os.path.join(cls.RUN_STATE_DIR, simulation_id, "state.json")
+        try:
+            if not os.path.exists(state_file):
+                return
+            with open(state_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            status_map = {
+                RunnerStatus.COMPLETED: "completed",
+                RunnerStatus.FAILED: "failed",
+                RunnerStatus.STOPPED: "stopped",
+            }
+            new_status = status_map.get(run_state.runner_status)
+            if new_status:
+                data['status'] = new_status
+                with open(state_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                logger.info(f"Synced state.json: {simulation_id} -> {new_status}")
+        except Exception as e:
+            logger.error(f"Failed to sync state.json for {simulation_id}: {e}")
+
+    @classmethod
     def start_simulation(
         cls,
         simulation_id: str,
@@ -544,11 +568,15 @@ class SimulationRunner:
             state.reddit_running = False
             cls._save_run_state(state)
 
+            # Sync state.json so the simulation status reflects completion
+            cls._sync_simulation_state(simulation_id, state)
+
         except Exception as e:
             logger.error(f"Monitor thread exception: {simulation_id}, error={str(e)}")
             state.runner_status = RunnerStatus.FAILED
             state.error = str(e)
             cls._save_run_state(state)
+            cls._sync_simulation_state(simulation_id, state)
 
         finally:
             # Stop graph memory updater
