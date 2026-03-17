@@ -114,6 +114,8 @@ EMBEDDING_BASE_URL=http://localhost:11434
 
 Located in `tools/` directory — each module is standalone and can be copied to other projects:
 
+### Infrastructure (stdlib-only unless noted)
+
 | Module | Purpose | Dependencies |
 |--------|---------|-------------|
 | `retry.py` | Exponential backoff decorators + batch retry | stdlib only |
@@ -123,6 +125,95 @@ Located in `tools/` directory — each module is standalone and can be copied to
 | `file_parser.py` | Text extraction + chunking | `PyMuPDF`, `charset-normalizer`, `chardet` |
 | `logger.py` | Dual-output rotating log setup | stdlib only |
 
+### Agent Patterns (higher-level, composable)
+
+| Module | Purpose | Dependencies |
+|--------|---------|-------------|
+| `json_repair.py` | Multi-stage JSON repair for LLM output | stdlib only |
+| `llm_agent.py` | Base class + stepwise orchestrator for LLM agents | `llm_client`, `json_repair` |
+| `batch_processor.py` | Parallel batch processing with per-item isolation | stdlib only |
+
+### How They Compose
+
+```
+llm_client.py ──→ llm_agent.py (LLMAgent base class)
+                      │
+json_repair.py ──────┘ (used internally for JSON parsing)
+                      │
+batch_processor.py ──→ (runs many LLMAgent.run() calls in parallel)
+                      │
+task_manager.py ─────→ (tracks overall progress of batch operations)
+                      │
+retry.py ────────────→ (wraps external API calls with backoff)
+```
+
+### Usage Example: Building a New LLM Agent
+
+```python
+from tools.llm_client import LLMClient
+from tools.llm_agent import LLMAgent
+from tools.batch_processor import BatchProcessor
+
+class SummaryAgent(LLMAgent):
+    def build_system_prompt(self, ctx):
+        return "You are a text summarization expert. Return JSON."
+
+    def build_user_prompt(self, ctx):
+        return f"Summarize this text in 2 sentences:\n\n{ctx['text']}"
+
+    def fallback(self, ctx, error):
+        return {"summary": ctx["text"][:200] + "..."}
+
+client = LLMClient()
+agent = SummaryAgent(client, required_fields=["summary"])
+
+# Single item:
+result = agent.run({"text": "Long document here..."})
+
+# Batch processing:
+processor = BatchProcessor(
+    worker_fn=lambda item: agent.run(item),
+    parallel_count=3,
+    progress_callback=lambda cur, total, msg: print(f"{cur}/{total}"),
+)
+results, failures = processor.run([{"text": t} for t in documents])
+```
+
+## Deep Patterns: How the Codebase Uses LLMs
+
+### Pattern: Decreasing Temperature on Retry
+Every LLM agent in the codebase starts at temperature 0.7 and decreases by 0.1 on each retry attempt. Lower temperature = more deterministic = more likely to produce valid JSON. This is implemented in `LLMAgent.run()`.
+
+### Pattern: Stepwise Generation to Avoid Token Overflow
+`SimulationConfigGenerator` splits one large generation task into 4+ steps:
+1. Time config (small JSON, ~500 tokens)
+2. Event config (medium JSON, ~1000 tokens)
+3. Agent configs (batched, 15 per call, ~2000 tokens each)
+4. Platform config (rule-based, no LLM needed)
+
+Each step uses a focused prompt with truncated context, avoiding the failure mode of asking for too much in a single call. This pattern is generalized in `StepwiseAgent`.
+
+### Pattern: Individual vs. Group Entity Handling
+`OasisProfileGenerator` distinguishes between individual entities (Person, Student, Professor) and group entities (Company, University, GovernmentAgency). Each type gets a different prompt template. Group entities get fixed age=30, gender="other". This two-template pattern recurs whenever entity types have fundamentally different structures.
+
+### Pattern: Context Aggregation with Priority Truncation
+When building LLM prompts, context is assembled from multiple sources:
+1. Entity attributes (always included)
+2. Graph edges/relationships (always included)
+3. Related node summaries (always included)
+4. Hybrid graph search results (deduplicated against #2)
+5. Original document text (truncated to fit remaining budget)
+
+The truncation order ensures the most specific context (direct relationships) is never lost, while bulk text (documents) gets cut first. Context budgets are configurable per-step.
+
+### Pattern: Type Alias Mapping for Fuzzy Entity Matching
+When LLM-generated configs reference entity types, they may use synonyms or different casing. `_assign_initial_post_agents()` maintains a type alias mapping:
+```python
+{"official": ["official", "university", "governmentagency"],
+ "student": ["student", "person"], ...}
+```
+This prevents brittle exact-match failures. Fallback: pick the agent with the highest influence weight.
+
 ## Lessons Learned
 
 1. **Ollama num_ctx is critical** — without explicitly setting it, prompts get silently truncated at 2048 tokens. Always pass `num_ctx` via extra_body.
@@ -130,3 +221,8 @@ Located in `tools/` directory — each module is standalone and can be copied to
 3. **File-based IPC is surprisingly robust** for local multi-process apps — simpler than sockets, no dependency on Redis/RabbitMQ.
 4. **Profile generation dominates wall-clock time** — 65 entities × 20s/each = ~20min. Parallelism helps but is bounded by VRAM.
 5. **JSON mode + fence stripping is necessary** — multiple model families add markdown fences around JSON even in JSON mode.
+6. **Decreasing temperature on retry** improves JSON validity — start creative (0.7), get more deterministic (0.5) on failure.
+7. **Stepwise generation beats monolithic prompts** — splitting into focused steps with small JSON outputs dramatically reduces parse failures. One 50-field JSON call fails often; five 10-field calls almost never do.
+8. **Always have a rule-based fallback per entity type** — LLMs are unreliable for 100% of items. Rule-based defaults (based on entity type lookup tables) ensure the pipeline never stalls.
+9. **Real-time file output during generation** gives users confidence the system is working — write results incrementally, not just at the end.
+10. **Pre-allocate result lists for order preservation** — when using ThreadPoolExecutor with as_completed(), items return out of order. Pre-allocating `[None] * total` and writing by index preserves input ordering.
