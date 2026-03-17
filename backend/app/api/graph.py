@@ -574,6 +574,116 @@ def get_graph_data(graph_id: str):
         }), 500
 
 
+# ============== Graph Enrichment Endpoint ==============
+
+@graph_bp.route('/enrich', methods=['POST'])
+def enrich_graph():
+    """
+    Enrich an existing graph with new text content.
+
+    Chunks the text and runs it through the NER pipeline (storage.add_text()),
+    adding new entities and relations to the graph. Async via TaskManager.
+
+    Request (JSON):
+        {
+            "graph_id": "mirofish_xxxx",   // Required
+            "text": "Natural language...",  // Required
+            "source": "portals_v4_commits" // Optional, audit trail label
+        }
+
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "task_id": "task_xxxx",
+                "chunk_count": 5
+            }
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        graph_id = data.get('graph_id')
+        text = data.get('text', '')
+        source = data.get('source', 'manual')
+
+        if not graph_id:
+            return jsonify({"success": False, "error": "Please provide graph_id"}), 400
+        if not text.strip():
+            return jsonify({"success": False, "error": "Please provide non-empty text"}), 400
+
+        storage = _get_storage()
+
+        # Chunk the text
+        chunks = TextProcessor.split_text(text, chunk_size=500, overlap=50)
+        chunk_count = len(chunks)
+        logger.info(f"Enrich graph {graph_id}: {len(text)} chars → {chunk_count} chunks (source={source})")
+
+        # Create async task
+        task_manager = TaskManager()
+        task_id = task_manager.create_task(f"Enrich graph: {source}")
+
+        def enrich_task():
+            enrich_logger = get_logger('mirofish.enrich')
+            try:
+                task_manager.update_task(
+                    task_id,
+                    status=TaskStatus.PROCESSING,
+                    message=f"Processing {chunk_count} chunks (source={source})...",
+                    progress=5
+                )
+
+                builder = GraphBuilderService(storage=storage)
+                episode_uuids = builder.add_text_batches(
+                    graph_id,
+                    chunks,
+                    batch_size=3,
+                    progress_callback=lambda msg, ratio: task_manager.update_task(
+                        task_id, message=msg, progress=5 + int(ratio * 90)
+                    )
+                )
+
+                task_manager.update_task(
+                    task_id,
+                    status=TaskStatus.COMPLETED,
+                    message="Enrichment complete",
+                    progress=100,
+                    result={
+                        "graph_id": graph_id,
+                        "source": source,
+                        "chunk_count": chunk_count,
+                        "episodes_added": len(episode_uuids)
+                    }
+                )
+                enrich_logger.info(f"[{task_id}] Enrichment complete: {len(episode_uuids)} episodes added")
+
+            except Exception as e:
+                enrich_logger.error(f"[{task_id}] Enrichment failed: {str(e)}")
+                task_manager.update_task(
+                    task_id,
+                    status=TaskStatus.FAILED,
+                    message=f"Enrichment failed: {str(e)}",
+                    error=traceback.format_exc()
+                )
+
+        thread = threading.Thread(target=enrich_task, daemon=True)
+        thread.start()
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "task_id": task_id,
+                "chunk_count": chunk_count
+            }
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 @graph_bp.route('/delete/<graph_id>', methods=['DELETE'])
 def delete_graph(graph_id: str):
     """

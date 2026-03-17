@@ -37,7 +37,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     """Single httpx client shared across all tool calls."""
     async with httpx.AsyncClient(
         base_url=BASE_URL,
-        timeout=httpx.Timeout(30.0, connect=5.0),
+        timeout=httpx.Timeout(15.0, connect=2.0),
     ) as client:
         yield AppContext(client=client)
 
@@ -83,13 +83,16 @@ async def mirofish_health() -> dict:
 async def mirofish_list_projects(limit: int = 50) -> dict:
     """List all MiroFish projects. Ontology details are summarized for compactness."""
     resp = await _get("/api/graph/project/list", params={"limit": limit})
-    for proj in resp.get("data", []):
-        ont = proj.get("ontology", {})
-        if ont:
-            proj["ontology"] = {
-                "entity_types": [e.get("name") for e in ont.get("entity_types", [])],
-                "edge_types": [e.get("name") for e in ont.get("edge_types", [])],
-            }
+    try:
+        for proj in resp.get("data", []):
+            ont = proj.get("ontology", {})
+            if ont:
+                proj["ontology"] = {
+                    "entity_types": [e.get("name") for e in ont.get("entity_types", [])],
+                    "edge_types": [e.get("name") for e in ont.get("edge_types", [])],
+                }
+    except Exception:
+        pass  # return raw resp if trimming fails
     return resp
 
 
@@ -174,41 +177,46 @@ async def mirofish_run_pipeline(
         max_rounds: Cap on simulation rounds. Optional.
         prepare_timeout: Max seconds to wait for preparation (default 600).
     """
-    # 1. Create
-    resp = await _post("/api/simulation/create", {"project_id": project_id})
-    if not resp.get("success"):
-        return {"step": "create", "result": resp}
-    sim_id = resp["data"]["simulation_id"]
+    try:
+        # 1. Create
+        resp = await _post("/api/simulation/create", {"project_id": project_id})
+        if not resp.get("success"):
+            return {"step": "create", "result": resp}
+        sim_id = resp.get("data", {}).get("simulation_id")
+        if not sim_id:
+            return {"error": "create succeeded but no simulation_id in response", "raw": resp}
 
-    # 2. Prepare
-    resp = await _post("/api/simulation/prepare", {"simulation_id": sim_id}, timeout=60.0)
-    if not resp.get("success"):
-        return {"step": "prepare", "simulation_id": sim_id, "result": resp}
+        # 2. Prepare
+        resp = await _post("/api/simulation/prepare", {"simulation_id": sim_id}, timeout=60.0)
+        if not resp.get("success"):
+            return {"step": "prepare", "simulation_id": sim_id, "result": resp}
 
-    task_id = resp.get("data", {}).get("task_id")
-    if task_id and not resp.get("data", {}).get("already_prepared"):
-        elapsed = 0
-        while elapsed < prepare_timeout:
-            await asyncio.sleep(5)
-            elapsed += 5
-            tr = await _get(f"/api/graph/task/{task_id}")
-            status = tr.get("data", {}).get("status", "")
-            if status in ("completed", "success"):
-                break
-            if status in ("failed", "error"):
-                return {"step": "prepare_poll", "simulation_id": sim_id, "result": tr}
-        else:
-            return {"step": "prepare_poll", "simulation_id": sim_id, "error": f"Timed out after {prepare_timeout}s"}
+        task_id = resp.get("data", {}).get("task_id")
+        if task_id and not resp.get("data", {}).get("already_prepared"):
+            elapsed = 0
+            while elapsed < prepare_timeout:
+                await asyncio.sleep(5)
+                elapsed += 5
+                tr = await _get(f"/api/graph/task/{task_id}")
+                status = tr.get("data", {}).get("status", "")
+                if status in ("completed", "success"):
+                    break
+                if status in ("failed", "error"):
+                    return {"step": "prepare_poll", "simulation_id": sim_id, "result": tr}
+            else:
+                return {"step": "prepare_poll", "simulation_id": sim_id, "error": f"Timed out after {prepare_timeout}s"}
 
-    # 3. Start
-    start_body: dict = {"simulation_id": sim_id, "platform": platform}
-    if max_rounds is not None:
-        start_body["max_rounds"] = max_rounds
-    resp = await _post("/api/simulation/start", start_body, timeout=60.0)
-    if not resp.get("success"):
-        return {"step": "start", "simulation_id": sim_id, "result": resp}
+        # 3. Start
+        start_body: dict = {"simulation_id": sim_id, "platform": platform}
+        if max_rounds is not None:
+            start_body["max_rounds"] = max_rounds
+        resp = await _post("/api/simulation/start", start_body, timeout=60.0)
+        if not resp.get("success"):
+            return {"step": "start", "simulation_id": sim_id, "result": resp}
 
-    return {"success": True, "simulation_id": sim_id, "status": "running", "data": resp.get("data")}
+        return {"success": True, "simulation_id": sim_id, "status": "running", "data": resp.get("data")}
+    except Exception as e:
+        return {"error": f"run_pipeline failed: {e}"}
 
 
 @mcp.tool()
@@ -263,6 +271,86 @@ async def mirofish_task_status(task_id: str) -> dict:
         task_id: Task ID returned by an async operation.
     """
     return await _get(f"/api/graph/task/{task_id}")
+
+
+@mcp.tool()
+async def mirofish_enrich_graph(
+    graph_id: str,
+    text: str,
+    source: str = "manual",
+) -> dict:
+    """Feed new context into an existing knowledge graph.
+
+    Chunks the text and runs NER pipeline to add entities/relations.
+    Returns a task_id — poll with mirofish_task_status.
+
+    Args:
+        graph_id: Graph to enrich (from project's graph_id).
+        text: Natural language paragraphs to process through NER.
+        source: Audit trail label (e.g. "portals_v4_commits", "dev_input", "user_feedback").
+    """
+    return await _post(
+        "/api/graph/enrich",
+        {"graph_id": graph_id, "text": text, "source": source},
+        timeout=60.0,
+    )
+
+
+@mcp.tool()
+async def mirofish_generate_report(simulation_id: str) -> dict:
+    """Generate a post-simulation analysis report.
+
+    Returns task_id — poll with mirofish_task_status.
+
+    Args:
+        simulation_id: The simulation to analyze.
+    """
+    return await _post(
+        "/api/report/generate",
+        {"simulation_id": simulation_id},
+        timeout=60.0,
+    )
+
+
+@mcp.tool()
+async def mirofish_get_report(simulation_id: str) -> dict:
+    """Get the generated report for a simulation.
+
+    Args:
+        simulation_id: The simulation whose report to retrieve.
+    """
+    resp = await _get(f"/api/report/by-simulation/{simulation_id}")
+    # Trim large markdown to stay within context limits
+    try:
+        data = resp.get("data", {})
+        md = data.get("markdown_content", "")
+        if len(md) > 3000:
+            data["markdown_content"] = md[:3000] + "\n\n... [truncated, use download endpoint for full report]"
+    except Exception:
+        pass
+    return resp
+
+
+@mcp.tool()
+async def mirofish_graph_search(
+    graph_id: str,
+    query: str,
+    limit: int = 10,
+) -> dict:
+    """Search entities and relations in a knowledge graph.
+
+    Useful for verifying enrichment worked or exploring graph content.
+
+    Args:
+        graph_id: The graph to search.
+        query: Natural language search query.
+        limit: Max results to return (default 10).
+    """
+    return await _post(
+        "/api/report/tools/search",
+        {"graph_id": graph_id, "query": query, "limit": limit},
+        timeout=15.0,
+    )
 
 
 if __name__ == "__main__":
