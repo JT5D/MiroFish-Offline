@@ -550,6 +550,29 @@ class SimulationRunner:
                 state.runner_status = RunnerStatus.COMPLETED
                 state.completed_at = datetime.now().isoformat()
                 logger.info(f"Simulation completed: {simulation_id}")
+
+                # Log to persistent benchmark
+                try:
+                    from ..utils.benchmark import get_bench
+                    duration = 0.0
+                    if state.started_at and state.completed_at:
+                        from datetime import datetime as dt
+                        t0 = dt.fromisoformat(state.started_at)
+                        t1 = dt.fromisoformat(state.completed_at)
+                        duration = (t1 - t0).total_seconds()
+                    tw = state.twitter_actions_count or 0
+                    rd = state.reddit_actions_count or 0
+                    get_bench().log_sim_run(
+                        simulation_id=simulation_id,
+                        platform=getattr(state, 'platform', 'parallel') or "parallel",
+                        total_rounds=state.total_rounds or 0,
+                        total_actions=tw + rd,
+                        twitter_actions=tw,
+                        reddit_actions=rd,
+                        duration_s=duration,
+                    )
+                except Exception as e:
+                    logger.debug(f"Benchmark sim logging failed: {e}")
             else:
                 state.runner_status = RunnerStatus.FAILED
                 # Read error information from the main log file
@@ -664,6 +687,29 @@ class SimulationRunner:
                                         state.runner_status = RunnerStatus.COMPLETED
                                         state.completed_at = datetime.now().isoformat()
                                         logger.info(f"All platform simulations completed: {state.simulation_id}")
+
+                                        # Log to persistent benchmark
+                                        try:
+                                            from ..utils.benchmark import get_bench
+                                            duration = 0.0
+                                            if state.started_at and state.completed_at:
+                                                t0 = datetime.fromisoformat(state.started_at)
+                                                t1 = datetime.fromisoformat(state.completed_at)
+                                                duration = (t1 - t0).total_seconds()
+                                            tw = state.twitter_actions_count or 0
+                                            rd = state.reddit_actions_count or 0
+                                            get_bench().log_sim_run(
+                                                simulation_id=state.simulation_id,
+                                                platform="parallel",
+                                                total_rounds=state.total_rounds or 0,
+                                                total_actions=tw + rd,
+                                                twitter_actions=tw,
+                                                reddit_actions=rd,
+                                                duration_s=duration,
+                                            )
+                                            logger.info(f"Benchmark: logged sim run {state.simulation_id}")
+                                        except Exception as e:
+                                            logger.warning(f"Benchmark sim log failed: {e}")
 
                                 # Update round information (from round_end events)
                                 elif event_type == "round_end":

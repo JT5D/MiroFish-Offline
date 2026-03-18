@@ -461,6 +461,7 @@ class SimulationConfigGenerator:
 
         for attempt in range(max_attempts):
             try:
+                _t0 = __import__('time').monotonic()
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
@@ -471,8 +472,23 @@ class SimulationConfigGenerator:
                     temperature=0.7 - (attempt * 0.1)  # Lower temperature with each retry
                     # Do not set max_tokens, let LLM generate freely
                 )
+                _elapsed = __import__('time').monotonic() - _t0
 
                 content = response.choices[0].message.content
+
+                try:
+                    from ..utils.benchmark import get_bench
+                    get_bench().log_llm_call(
+                        task_type="sim_config",
+                        provider=self.base_url or '',
+                        model=self.model_name or '',
+                        latency_s=_elapsed,
+                        success=bool(content),
+                        tokens=response.usage.completion_tokens if response.usage else 0,
+                        base_url=self.base_url or '',
+                    )
+                except Exception:
+                    pass
                 finish_reason = response.choices[0].finish_reason
 
                 # Check if output was truncated

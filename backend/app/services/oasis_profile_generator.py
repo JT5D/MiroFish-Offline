@@ -480,6 +480,7 @@ class OasisProfileGenerator:
 
         for attempt in range(max_attempts):
             try:
+                _t0 = __import__('time').monotonic()
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
@@ -490,8 +491,24 @@ class OasisProfileGenerator:
                     temperature=0.7 - (attempt * 0.1)  # Lower temperature with each retry
                     # No max_tokens set, let LLM generate freely
                 )
+                _elapsed = __import__('time').monotonic() - _t0
 
                 content = response.choices[0].message.content
+
+                # Log to benchmark
+                try:
+                    from ..utils.benchmark import get_bench
+                    get_bench().log_llm_call(
+                        task_type="profile",
+                        provider=self.base_url or '',
+                        model=self.model_name or '',
+                        latency_s=_elapsed,
+                        success=bool(content),
+                        tokens=response.usage.completion_tokens if response.usage else 0,
+                        base_url=self.base_url or '',
+                    )
+                except Exception:
+                    pass
 
                 # Check if truncated (finish_reason is not 'stop')
                 finish_reason = response.choices[0].finish_reason
