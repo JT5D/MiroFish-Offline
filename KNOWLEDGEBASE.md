@@ -83,9 +83,31 @@ All services access it through Flask's app context. Graph operations use Cypher 
 
 ### Resource Management
 - **Ollama qwen2.5:14b**: ~9GB VRAM/RAM. Profile generation: ~20s per entity.
-- **Neo4j**: Docker container. Set heap to 512MB (not 2GB) to keep system responsive.
-- **Simulation parallelism**: `parallel_profile_count=2` is safe for most machines. Higher values increase VRAM pressure.
+- **Neo4j**: Docker container. Heap set to 2G–4G for production workloads.
+- **Simulation parallelism**: `parallel_profile_count=5` (default). Backend fires up to 5 parallel profile gen threads + 3 config gen workers. `OLLAMA_NUM_PARALLEL=6` ensures minimal queuing.
 - **OLLAMA_NUM_CTX**: Defaults to 8192. Ollama's own default (2048) causes silent prompt truncation. The LLM client injects this via `extra_body.options.num_ctx`.
+
+### Ollama Performance Tuning (M3 Max / 128GB)
+Optimized `launchctl` environment variables for Apple Silicon with unified memory:
+```
+OLLAMA_FLASH_ATTENTION=1     # Metal-accelerated flash attention — fastest single-token latency
+OLLAMA_KV_CACHE_TYPE=q8_0    # Quantized KV cache — halves memory per concurrent request
+OLLAMA_NUM_PARALLEL=6        # 6 concurrent inference slots (matches profile gen + config gen load)
+OLLAMA_MAX_LOADED_MODELS=3   # Keep qwen2.5:14b + nomic-embed-text + one more hot (no cold-load penalty)
+OLLAMA_NUM_CTX=8192          # Explicit context window (Ollama default 2048 silently truncates)
+```
+**Native Ollama is faster on macOS.** Docker on macOS runs inside a Linux VM with no Metal GPU access — inference falls back to CPU-only (~10-20x slower for 14B models). Native Ollama uses Metal directly on Apple Silicon unified memory, leveraging all GPU cores with zero-copy memory access. The `--gpus all` Docker flag only works on Linux with NVIDIA GPUs.
+
+**Model strategy**: Use `qwen2.5:7b` (~2x faster) for batch/throughput tasks (profile gen). Use `qwen2.5:14b` for quality-sensitive tasks (reports, complex reasoning). Keep `nomic-embed-text` always loaded for embeddings.
+
+Applied via:
+```bash
+launchctl setenv OLLAMA_FLASH_ATTENTION 1
+launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
+launchctl setenv OLLAMA_NUM_PARALLEL 6
+launchctl setenv OLLAMA_MAX_LOADED_MODELS 3
+# Restart Ollama after changes
+```
 
 ### Model Quirks
 - Some models emit `<think>` reasoning blocks — `LLMClient` strips these automatically.
@@ -379,6 +401,96 @@ Each layer adds abstraction but preserves traceability back to its source.
 **Subprocess isolation for unreliable workloads.** Simulations run in separate Python processes, not in the Flask server. IPC happens via filesystem (command/response files). A crashed simulation doesn't crash the backend. Status is tracked via real-time log reading, not in-process state.
 
 **Graceful degradation everywhere.** If graph search fails → local keyword matching. If LLM fails → rule-based generation. If interview fails → helpful error message. If graph update fails → retry 3× with backoff. No component has a hard failure mode.
+
+## Multi-LLM Router Architecture
+
+### Design: KB-First with Optional Cloud Acceleration
+
+The LLM Router (`utils/llm_router.py`) enables per-task provider routing with health-aware fallback chains. Every chain ends with the default Ollama provider as a last-resort fallback.
+
+```
+Request → TaskType → Provider Chain → First Healthy Provider → OpenAI Client
+                                                    ↓ (if unhealthy)
+                                              Next in Chain
+                                                    ↓ (if all down)
+                                              Default (Ollama)
+```
+
+**Key properties:**
+- **Zero-config compatible**: No new env vars = identical to before (Ollama only)
+- **Non-blocking health checks**: Cached 30s, probed in background threads
+- **Optimistic first check**: New providers return healthy immediately while probing
+- **Per-task routing**: Profile gen, report, sim config, graph tools each get their own chain
+
+**Configuration via env vars:**
+```
+PROFILE_LLM_API_KEY=sk-...
+PROFILE_LLM_BASE_URL=https://api.openai.com/v1
+PROFILE_LLM_MODEL_NAME=gpt-4o-mini
+```
+
+**Files**: `utils/llm_router.py` (router singleton), `utils/llm_provider.py` (factory), `config.py` (env vars)
+
+### KB-Only Mode (MIROFISH_KB_ONLY=1)
+
+When set, all profile generation skips LLM calls entirely:
+- Entity attributes, edges, and summaries from Neo4j provide persona content
+- Template-based construction builds bio, persona, topics from graph data
+- Rule-based defaults fill remaining fields (age, gender, MBTI by entity type)
+- Useful for: zero-token operation, fast iteration, testing graph quality
+
+**File**: `services/oasis_profile_generator.py:_generate_profile_kb_only()`
+
+### Cross-Graph Search
+
+Search across multiple knowledge graphs simultaneously:
+- Embed query once, search each graph_id via hybrid (vector + BM25)
+- Re-rank all results by score across graphs
+- API: `POST /api/graph/cross-search` with `graph_ids[]`
+
+Enables connecting insights across separate projects (e.g., Portals paper + XR industry graph).
+
+**Files**: `storage/search_service.py:search_cross_graph()`, `storage/neo4j_storage.py`, `api/graph.py`
+
+### Structured KB Injection
+
+Bypass NER pipeline when entities/relations are pre-extracted:
+- `POST /api/graph/enrich-structured` accepts JSON entities + relations
+- Direct MERGE into Neo4j (no chunking, no LLM calls)
+- Saves tokens when caller (e.g., Claude Code) already did extraction
+
+**Files**: `api/graph.py:enrich_structured()`, `mcp-server/server.py:mirofish_enrich_structured()`
+
+### Dynamic Provider Discovery
+
+`POST /api/graph/llm/discover` auto-detects local LLM providers and configures routing:
+
+1. **Scans known ports**: Ollama (11434), LM Studio (1234), llama.cpp (8080), vLLM (8000), GPT4All (4891), Jan (3001)
+2. **Probes models**: Gets full model list from each provider, estimates parameter count and tier
+3. **Assigns by strategy**:
+   - Quality-sensitive (report, graph_tools) → highest-tier model on any provider
+   - Throughput-sensitive (profile_gen, sim_config, enrichment) → fastest provider
+   - Multi-provider → spreads load across different servers
+4. **Sets env vars + reloads router**: Changes take effect immediately
+
+**Files**: `utils/llm_discovery.py`, `api/graph.py:discover_llm_providers()`, MCP: `mirofish_discover_providers`
+
+### Auto-Improvement Feedback Loop
+
+Closed-loop simulation refinement:
+```
+Simulate → Extract Insights → Enrich Graph → Re-simulate → ...
+```
+
+1. Run simulation (or use existing completed run)
+2. Parse action logs: top posts by engagement, trending topics, agent influence
+3. Feed insights as natural language into graph enrichment pipeline
+4. Re-run simulation with enriched graph data
+5. Repeat for N iterations
+
+**Files**: `api/simulation.py:feedback_loop()`, `mcp-server/server.py:mirofish_feedback_loop()`
+
+---
 
 ## Lessons Learned
 

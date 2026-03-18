@@ -402,7 +402,7 @@ class GraphToolsService:
     def llm(self) -> LLMClient:
         """Lazy initialization of LLM client"""
         if self._llm_client is None:
-            self._llm_client = LLMClient()
+            self._llm_client = LLMClient(task_type="graph_tools")
         return self._llm_client
 
     # ========== Basic Tools ==========
@@ -809,7 +809,7 @@ class GraphToolsService:
         query: str,
         simulation_requirement: str,
         report_context: str = "",
-        max_sub_queries: int = 5
+        max_sub_queries: int = 3
     ) -> InsightForgeResult:
         """
         [InsightForge - Deep Insight Retrieval]
@@ -821,6 +821,10 @@ class GraphToolsService:
         4. Traces relationship chains
         5. Integrates all results to generate deep insights
         """
+        import time as _time
+        tool_start = _time.time()
+        TOOL_TIMEOUT = 90  # 90s max for entire InsightForge call
+
         logger.info(f"InsightForge deep insight retrieval: {query[:50]}...")
 
         result = InsightForgeResult(
@@ -829,26 +833,34 @@ class GraphToolsService:
             sub_queries=[]
         )
 
-        # Step 1: Use LLM to generate sub-queries
-        sub_queries = self._generate_sub_queries(
-            query=query,
-            simulation_requirement=simulation_requirement,
-            report_context=report_context,
-            max_queries=max_sub_queries
-        )
-        result.sub_queries = sub_queries
-        logger.info(f"Generated {len(sub_queries)} sub-queries")
+        # Step 1: Use LLM to generate sub-queries (with timeout guard)
+        try:
+            sub_queries = self._generate_sub_queries(
+                query=query,
+                simulation_requirement=simulation_requirement,
+                report_context=report_context,
+                max_queries=max_sub_queries
+            )
+        except Exception as e:
+            logger.warning(f"InsightForge sub-query generation failed: {e}, using defaults")
+            sub_queries = [query, f"Key participants in {query[:50]}"]
 
-        # Step 2: Perform semantic search for each sub-query
+        result.sub_queries = sub_queries
+        logger.info(f"Generated {len(sub_queries)} sub-queries ({_time.time()-tool_start:.1f}s)")
+
+        # Step 2: Perform semantic search for each sub-query (with timeout guard)
         all_facts = []
         all_edges = []
         seen_facts = set()
 
         for sub_query in sub_queries:
+            if _time.time() - tool_start > TOOL_TIMEOUT:
+                logger.warning(f"InsightForge timeout at sub-query search ({_time.time()-tool_start:.0f}s)")
+                break
             search_result = self.search_graph(
                 graph_id=graph_id,
                 query=sub_query,
-                limit=15,
+                limit=10,
                 scope="edges"
             )
 
@@ -859,22 +871,24 @@ class GraphToolsService:
 
             all_edges.extend(search_result.edges)
 
-        # Also search the original query
-        main_search = self.search_graph(
-            graph_id=graph_id,
-            query=query,
-            limit=20,
-            scope="edges"
-        )
-        for fact in main_search.facts:
-            if fact not in seen_facts:
-                all_facts.append(fact)
-                seen_facts.add(fact)
+        # Also search the original query (if time permits)
+        if _time.time() - tool_start < TOOL_TIMEOUT:
+            main_search = self.search_graph(
+                graph_id=graph_id,
+                query=query,
+                limit=15,
+                scope="edges"
+            )
+            for fact in main_search.facts:
+                if fact not in seen_facts:
+                    all_facts.append(fact)
+                    seen_facts.add(fact)
 
         result.semantic_facts = all_facts
         result.total_facts = len(all_facts)
+        logger.info(f"InsightForge search complete: {len(all_facts)} facts ({_time.time()-tool_start:.1f}s)")
 
-        # Step 3: Extract related entity UUIDs from edges
+        # Step 3: Extract related entity UUIDs from edges (if time permits)
         entity_uuids = set()
         for edge_data in all_edges:
             if isinstance(edge_data, dict):
@@ -885,13 +899,14 @@ class GraphToolsService:
                 if target_uuid:
                     entity_uuids.add(target_uuid)
 
-        # Get related entity details
+        # Get related entity details (capped at 10 entities, with timeout)
         entity_insights = []
         node_map = {}
+        MAX_ENTITY_LOOKUPS = 10
 
-        for uuid in list(entity_uuids):
-            if not uuid:
-                continue
+        for uuid in list(entity_uuids)[:MAX_ENTITY_LOOKUPS]:
+            if not uuid or _time.time() - tool_start > TOOL_TIMEOUT:
+                break
             try:
                 node = self.get_node_detail(uuid)
                 if node:

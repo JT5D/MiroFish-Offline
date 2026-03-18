@@ -241,6 +241,50 @@ class SearchService:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
 
+    def search_cross_graph(
+        self,
+        session: Neo4jSession,
+        query: str,
+        graph_ids: List[str],
+        limit: int = 20,
+        scope: str = "edges",
+    ) -> List[Dict[str, Any]]:
+        """
+        Search across multiple graphs, re-ranking results by score.
+
+        Embeds the query once, then searches each graph_id and merges.
+
+        Args:
+            session: Neo4j session
+            query: Search query
+            graph_ids: List of graph IDs to search across
+            limit: Max results to return
+            scope: "edges", "nodes", or "both"
+
+        Returns:
+            List of result dicts with 'graph_id' and 'score' fields.
+        """
+        all_results = []
+
+        for gid in graph_ids:
+            if scope in ("edges", "both"):
+                edges = self.search_edges(session, gid, query, limit=limit)
+                for e in edges:
+                    e["graph_id"] = gid
+                    e["result_type"] = "edge"
+                all_results.extend(edges)
+
+            if scope in ("nodes", "both"):
+                nodes = self.search_nodes(session, gid, query, limit=limit)
+                for n in nodes:
+                    n["graph_id"] = gid
+                    n["result_type"] = "node"
+                all_results.extend(nodes)
+
+        # Sort by score descending across all graphs
+        all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return all_results[:limit]
+
     @staticmethod
     def _escape_lucene(query: str) -> str:
         """Escape special Lucene query characters."""

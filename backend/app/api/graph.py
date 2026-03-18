@@ -684,6 +684,324 @@ def enrich_graph():
         }), 500
 
 
+@graph_bp.route('/enrich-structured', methods=['POST'])
+def enrich_structured():
+    """
+    Enrich a graph with pre-extracted entities and relations.
+
+    Bypasses NER pipeline — caller already did extraction.
+    Directly MERGEs entities and relations into Neo4j.
+
+    Request (JSON):
+        {
+            "graph_id": "mirofish_xxxx",
+            "entities": [
+                {"name": "Foo", "type": "Person", "summary": "...", "attributes": {}},
+                ...
+            ],
+            "relations": [
+                {"source": "Foo", "target": "Bar", "relation": "WORKS_WITH", "fact": "..."},
+                ...
+            ],
+            "source": "external_extraction"
+        }
+
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "entities_merged": 5,
+                "relations_merged": 3
+            }
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        graph_id = data.get('graph_id')
+        entities = data.get('entities', [])
+        relations = data.get('relations', [])
+        source = data.get('source', 'structured')
+
+        if not graph_id:
+            return jsonify({"success": False, "error": "Please provide graph_id"}), 400
+        if not entities and not relations:
+            return jsonify({"success": False, "error": "Please provide entities and/or relations"}), 400
+
+        storage = _get_storage()
+
+        entities_merged = 0
+        relations_merged = 0
+
+        def _merge(tx):
+            nonlocal entities_merged, relations_merged
+
+            # Merge entities
+            for ent in entities:
+                name = ent.get('name', '').strip()
+                if not name:
+                    continue
+                entity_type = ent.get('type', 'Entity')
+                summary = ent.get('summary', '')
+                attributes = ent.get('attributes', {})
+
+                # MERGE node by name + graph_id, set properties
+                tx.run(
+                    """
+                    MERGE (n:Entity {name: $name, graph_id: $graph_id})
+                    SET n.summary = CASE WHEN n.summary IS NULL OR n.summary = ''
+                                         THEN $summary ELSE n.summary END,
+                        n.source = $source,
+                        n.updated_at = datetime()
+                    WITH n
+                    CALL apoc.create.addLabels(n, [$entity_type]) YIELD node
+                    RETURN node
+                    """,
+                    name=name,
+                    graph_id=graph_id,
+                    summary=summary,
+                    source=source,
+                    entity_type=entity_type,
+                )
+                entities_merged += 1
+
+            # Merge relations
+            for rel in relations:
+                src = rel.get('source', '').strip()
+                tgt = rel.get('target', '').strip()
+                relation = rel.get('relation', 'RELATED_TO')
+                fact = rel.get('fact', '')
+                if not src or not tgt:
+                    continue
+
+                tx.run(
+                    """
+                    MATCH (a:Entity {name: $src, graph_id: $graph_id})
+                    MATCH (b:Entity {name: $tgt, graph_id: $graph_id})
+                    MERGE (a)-[r:RELATES_TO {name: $relation, graph_id: $graph_id}]->(b)
+                    SET r.fact = $fact,
+                        r.source = $source,
+                        r.updated_at = datetime()
+                    """,
+                    src=src,
+                    tgt=tgt,
+                    graph_id=graph_id,
+                    relation=relation,
+                    fact=fact,
+                    source=source,
+                )
+                relations_merged += 1
+
+        # Try direct transaction first; fall back to apoc-free version if apoc is missing
+        try:
+            with storage._driver.session() as session:
+                session.execute_write(_merge)
+        except Exception as apoc_err:
+            if 'apoc' in str(apoc_err).lower():
+                # Retry without apoc.create.addLabels
+                entities_merged = 0
+                relations_merged = 0
+
+                def _merge_no_apoc(tx):
+                    nonlocal entities_merged, relations_merged
+                    for ent in entities:
+                        name = ent.get('name', '').strip()
+                        if not name:
+                            continue
+                        summary = ent.get('summary', '')
+                        tx.run(
+                            """
+                            MERGE (n:Entity {name: $name, graph_id: $graph_id})
+                            SET n.summary = CASE WHEN n.summary IS NULL OR n.summary = ''
+                                                 THEN $summary ELSE n.summary END,
+                                n.source = $source,
+                                n.updated_at = datetime()
+                            """,
+                            name=name, graph_id=graph_id, summary=summary, source=source,
+                        )
+                        entities_merged += 1
+
+                    for rel in relations:
+                        src = rel.get('source', '').strip()
+                        tgt = rel.get('target', '').strip()
+                        relation = rel.get('relation', 'RELATED_TO')
+                        fact = rel.get('fact', '')
+                        if not src or not tgt:
+                            continue
+                        tx.run(
+                            """
+                            MATCH (a:Entity {name: $src, graph_id: $graph_id})
+                            MATCH (b:Entity {name: $tgt, graph_id: $graph_id})
+                            MERGE (a)-[r:RELATES_TO {name: $relation, graph_id: $graph_id}]->(b)
+                            SET r.fact = $fact, r.source = $source, r.updated_at = datetime()
+                            """,
+                            src=src, tgt=tgt, graph_id=graph_id,
+                            relation=relation, fact=fact, source=source,
+                        )
+                        relations_merged += 1
+
+                with storage._driver.session() as session:
+                    session.execute_write(_merge_no_apoc)
+            else:
+                raise
+
+        logger.info(f"Structured enrichment: {entities_merged} entities, {relations_merged} relations merged into {graph_id}")
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "graph_id": graph_id,
+                "entities_merged": entities_merged,
+                "relations_merged": relations_merged,
+                "source": source,
+            }
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@graph_bp.route('/cross-search', methods=['POST'])
+def cross_search():
+    """
+    Search across multiple knowledge graphs.
+
+    Embeds the query once, searches each graph, and re-ranks by score.
+
+    Request (JSON):
+        {
+            "query": "search text",
+            "graph_ids": ["mirofish_aaa", "mirofish_bbb"],
+            "limit": 20,          // Optional, default 20
+            "scope": "edges"      // Optional: "edges", "nodes", "both"
+        }
+
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "query": "...",
+                "results": [...],
+                "count": 15
+            }
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        query = data.get('query', '')
+        graph_ids = data.get('graph_ids', [])
+        limit = data.get('limit', 20)
+        scope = data.get('scope', 'edges')
+
+        if not query.strip():
+            return jsonify({"success": False, "error": "Please provide a query"}), 400
+        if not graph_ids or not isinstance(graph_ids, list):
+            return jsonify({"success": False, "error": "Please provide graph_ids as a list"}), 400
+
+        storage = _get_storage()
+        results = storage.search_cross_graph(
+            query=query,
+            graph_ids=graph_ids,
+            limit=limit,
+            scope=scope,
+        )
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "query": query,
+                "results": results,
+                "count": len(results),
+            }
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@graph_bp.route('/llm/discover', methods=['POST'])
+def discover_llm_providers():
+    """
+    Auto-discover local LLM providers and configure optimal routing.
+
+    Scans known ports (Ollama, LM Studio, llama.cpp, etc.),
+    ranks models by capability, and assigns them to task types.
+
+    Request (JSON, all optional):
+        {
+            "dry_run": false,     // If true, don't apply changes
+            "reload_router": true // If true, reload the LLM router after applying
+        }
+
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "providers": [...],
+                "assignments": {...},
+                "changes": {...}
+            }
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        dry_run = data.get('dry_run', False)
+        reload_router = data.get('reload_router', True)
+
+        from ..utils.llm_discovery import discover_and_configure
+        result = discover_and_configure(dry_run=dry_run)
+
+        # Reload the router singleton to pick up new env vars
+        if not dry_run and reload_router and result.get('changes'):
+            from ..utils.llm_router import _router_lock
+            import app.utils.llm_router as router_mod
+            with _router_lock:
+                router_mod._router_instance = None
+            # Next call to get_router() will re-init with new env vars
+            logger.info("LLM router will reload on next use")
+
+        return jsonify({
+            "success": True,
+            "data": result,
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@graph_bp.route('/llm/status', methods=['GET'])
+def llm_status():
+    """
+    Get current LLM router status — provider health, chains, and assignments.
+    """
+    try:
+        from ..utils.llm_router import get_router
+        router = get_router()
+        return jsonify({
+            "success": True,
+            "data": {
+                "chains": router.get_chains(),
+                "health": router.get_status(),
+            }
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+        }), 500
+
+
 @graph_bp.route('/delete/<graph_id>', methods=['DELETE'])
 def delete_graph(graph_id: str):
     """

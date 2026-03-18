@@ -504,6 +504,23 @@ class Neo4jStorage(GraphStorage):
 
         return result
 
+    def search_cross_graph(
+        self,
+        query: str,
+        graph_ids: List[str],
+        limit: int = 20,
+        scope: str = "edges",
+    ):
+        """
+        Search across multiple graphs, returning re-ranked results.
+
+        Delegates to SearchService.search_cross_graph().
+        """
+        with self._driver.session() as session:
+            return self._search.search_cross_graph(
+                session, query, graph_ids, limit, scope
+            )
+
     # ----------------------------------------------------------------
     # Graph info
     # ----------------------------------------------------------------

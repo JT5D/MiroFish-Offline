@@ -12,6 +12,7 @@ Uses a step-by-step generation strategy to avoid failures from generating overly
 
 import json
 import math
+import concurrent.futures
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -227,6 +228,16 @@ class SimulationConfigGenerator:
         base_url: Optional[str] = None,
         model_name: Optional[str] = None
     ):
+        # Use router if no explicit params provided
+        if not (api_key or base_url or model_name):
+            from ..utils.llm_provider import get_provider_config
+            from ..utils.llm_router import TaskType
+            provider = get_provider_config(TaskType.SIM_CONFIG)
+            if provider:
+                api_key = provider.api_key
+                base_url = provider.base_url
+                model_name = provider.model
+
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model_name = model_name or Config.LLM_MODEL_NAME
@@ -304,25 +315,36 @@ class SimulationConfigGenerator:
         event_config = self._parse_event_config(event_config_result)
         reasoning_parts.append(f"Event config: {event_config_result.get('reasoning', 'Success')}")
 
-        # ========== Steps 3-N: Generate Agent configurations in batches ==========
+        # ========== Steps 3-N: Generate Agent configurations in batches (parallel) ==========
         all_agent_configs = []
+        batch_args = []
         for batch_idx in range(num_batches):
             start_idx = batch_idx * self.AGENTS_PER_BATCH
             end_idx = min(start_idx + self.AGENTS_PER_BATCH, len(entities))
             batch_entities = entities[start_idx:end_idx]
+            batch_args.append((batch_idx, start_idx, end_idx, batch_entities))
 
-            report_progress(
-                3 + batch_idx,
-                f"Generating Agent configurations ({start_idx + 1}-{end_idx}/{len(entities)})..."
-            )
+        report_progress(3, f"Generating Agent configurations ({len(entities)} entities, {num_batches} batches)...")
 
-            batch_configs = self._generate_agent_configs_batch(
-                context=context,
-                entities=batch_entities,
-                start_idx=start_idx,
-                simulation_requirement=simulation_requirement
-            )
-            all_agent_configs.extend(batch_configs)
+        MAX_CONFIG_WORKERS = min(3, num_batches)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONFIG_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    self._generate_agent_configs_batch,
+                    context=context,
+                    entities=args[3],
+                    start_idx=args[1],
+                    simulation_requirement=simulation_requirement
+                ): args[1]
+                for args in batch_args
+            }
+            results_by_start = {}
+            for future in concurrent.futures.as_completed(futures):
+                start_idx = futures[future]
+                results_by_start[start_idx] = future.result()
+            # Reassemble in order
+            for args in batch_args:
+                all_agent_configs.extend(results_by_start[args[1]])
 
         reasoning_parts.append(f"Agent configs: Successfully generated {len(all_agent_configs)}")
 

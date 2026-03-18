@@ -32,6 +32,30 @@ class Config:
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'http://localhost:11434/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'qwen2.5:32b')
 
+    # Per-task LLM overrides (empty = use default LLM_* above)
+    PROFILE_LLM_API_KEY = os.environ.get('PROFILE_LLM_API_KEY', '')
+    PROFILE_LLM_BASE_URL = os.environ.get('PROFILE_LLM_BASE_URL', '')
+    PROFILE_LLM_MODEL_NAME = os.environ.get('PROFILE_LLM_MODEL_NAME', '')
+
+    SIM_CONFIG_LLM_API_KEY = os.environ.get('SIM_CONFIG_LLM_API_KEY', '')
+    SIM_CONFIG_LLM_BASE_URL = os.environ.get('SIM_CONFIG_LLM_BASE_URL', '')
+    SIM_CONFIG_LLM_MODEL_NAME = os.environ.get('SIM_CONFIG_LLM_MODEL_NAME', '')
+
+    REPORT_LLM_API_KEY = os.environ.get('REPORT_LLM_API_KEY', '')
+    REPORT_LLM_BASE_URL = os.environ.get('REPORT_LLM_BASE_URL', '')
+    REPORT_LLM_MODEL_NAME = os.environ.get('REPORT_LLM_MODEL_NAME', '')
+
+    ENRICHMENT_LLM_API_KEY = os.environ.get('ENRICHMENT_LLM_API_KEY', '')
+    ENRICHMENT_LLM_BASE_URL = os.environ.get('ENRICHMENT_LLM_BASE_URL', '')
+    ENRICHMENT_LLM_MODEL_NAME = os.environ.get('ENRICHMENT_LLM_MODEL_NAME', '')
+
+    GRAPH_TOOLS_LLM_API_KEY = os.environ.get('GRAPH_TOOLS_LLM_API_KEY', '')
+    GRAPH_TOOLS_LLM_BASE_URL = os.environ.get('GRAPH_TOOLS_LLM_BASE_URL', '')
+    GRAPH_TOOLS_LLM_MODEL_NAME = os.environ.get('GRAPH_TOOLS_LLM_MODEL_NAME', '')
+
+    # KB-only mode: zero LLM calls, profiles from graph+templates
+    MIROFISH_KB_ONLY = os.environ.get('MIROFISH_KB_ONLY', '0') == '1'
+
     # Neo4j configuration
     NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
     NEO4J_USER = os.environ.get('NEO4J_USER', 'neo4j')

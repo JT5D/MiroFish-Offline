@@ -69,15 +69,11 @@ class OasisAgentProfile:
             "created_at": self.created_at,
         }
 
-        # Add additional persona information (if available)
-        if self.age:
-            profile["age"] = self.age
-        if self.gender:
-            profile["gender"] = self.gender
-        if self.mbti:
-            profile["mbti"] = self.mbti
-        if self.country:
-            profile["country"] = self.country
+        # OASIS requires mbti, age, gender, country — always include with defaults
+        profile["age"] = self.age or 30
+        profile["gender"] = self.gender or "other"
+        profile["mbti"] = self.mbti or "INTJ"
+        profile["country"] = self.country or "US"
         if self.profession:
             profile["profession"] = self.profession
         if self.interested_topics:
@@ -99,15 +95,11 @@ class OasisAgentProfile:
             "created_at": self.created_at,
         }
 
-        # Add additional persona information
-        if self.age:
-            profile["age"] = self.age
-        if self.gender:
-            profile["gender"] = self.gender
-        if self.mbti:
-            profile["mbti"] = self.mbti
-        if self.country:
-            profile["country"] = self.country
+        # OASIS requires mbti, age, gender, country — always include with defaults
+        profile["age"] = self.age or 30
+        profile["gender"] = self.gender or "other"
+        profile["mbti"] = self.mbti or "INTJ"
+        profile["country"] = self.country or "US"
         if self.profession:
             profile["profession"] = self.profession
         if self.interested_topics:
@@ -185,6 +177,16 @@ class OasisProfileGenerator:
         storage: Optional[GraphStorage] = None,
         graph_id: Optional[str] = None
     ):
+        # Use router if no explicit params provided
+        if not (api_key or base_url or model_name):
+            from ..utils.llm_provider import get_provider_config
+            from ..utils.llm_router import TaskType
+            provider = get_provider_config(TaskType.PROFILE_GEN)
+            if provider:
+                api_key = provider.api_key
+                base_url = provider.base_url
+                model_name = provider.model
+
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model_name = model_name or Config.LLM_MODEL_NAME
@@ -227,7 +229,14 @@ class OasisProfileGenerator:
         # Build context information
         context = self._build_entity_context(entity)
 
-        if use_llm:
+        # KB-only mode: skip LLM entirely, use graph data + templates
+        if Config.MIROFISH_KB_ONLY:
+            profile_data = self._generate_profile_kb_only(
+                entity=entity,
+                entity_type=entity_type,
+                context=context,
+            )
+        elif use_llm:
             # Use LLM to generate detailed persona
             profile_data = self._generate_profile_with_llm(
                 entity_name=name,
@@ -715,6 +724,106 @@ Important:
 - age must be the integer 30, gender must be the string "other"
 - Institutional account communications should match its identity positioning"""
 
+    def _generate_profile_kb_only(
+        self,
+        entity: 'EntityNode',
+        entity_type: str,
+        context: str,
+    ) -> Dict[str, Any]:
+        """
+        Generate a profile purely from graph data without any LLM calls.
+
+        Uses entity attributes, related edges, node summaries, and
+        pre-computed embeddings for similarity-based attribute inference.
+        Triggered when MIROFISH_KB_ONLY=1.
+        """
+        name = entity.name
+        summary = entity.summary or ""
+        attrs = entity.attributes or {}
+
+        # Start with rule-based defaults for the entity type
+        base = self._generate_profile_rule_based(
+            entity_name=name,
+            entity_type=entity_type,
+            entity_summary=summary,
+            entity_attributes=attrs,
+        )
+
+        # Enrich bio from graph context
+        context_lines = [line.strip("- ") for line in context.split("\n") if line.strip() and not line.startswith("###")]
+        top_facts = context_lines[:10]
+
+        if summary:
+            bio = summary[:200]
+        elif top_facts:
+            bio = ". ".join(top_facts[:2])[:200]
+        else:
+            bio = base.get("bio", f"{entity_type}: {name}")
+
+        # Build a rich persona from graph context
+        persona_parts = []
+        if summary:
+            persona_parts.append(summary)
+
+        # Extract attributes that inform persona
+        occupation = attrs.get("occupation") or attrs.get("role") or attrs.get("position") or base.get("profession", entity_type)
+        location = attrs.get("location") or attrs.get("country") or attrs.get("headquarters")
+
+        if occupation:
+            persona_parts.append(f"Occupation: {occupation}.")
+        if location:
+            persona_parts.append(f"Based in: {location}.")
+
+        # Add relationship context
+        if entity.related_edges:
+            rel_facts = []
+            for edge in entity.related_edges[:8]:
+                fact = edge.get("fact", "")
+                if fact and len(fact) > 10:
+                    rel_facts.append(fact)
+            if rel_facts:
+                persona_parts.append("Key facts: " + "; ".join(rel_facts[:5]))
+
+        # Add related entity summaries
+        if entity.related_nodes:
+            related = []
+            for node in entity.related_nodes[:5]:
+                node_name = node.get("name", "")
+                node_summary = node.get("summary", "")
+                if node_name and node_summary:
+                    related.append(f"{node_name}: {node_summary[:80]}")
+            if related:
+                persona_parts.append("Connected to: " + "; ".join(related[:3]))
+
+        # Extract interested topics from edges and attributes
+        topics = set(base.get("interested_topics", []))
+        for edge in (entity.related_edges or []):
+            edge_name = edge.get("edge_name", "")
+            if edge_name:
+                topics.add(edge_name.replace("_", " ").title())
+        topics = list(topics)[:8]
+
+        persona = " ".join(persona_parts) if persona_parts else base.get("persona", f"{name} is a {entity_type}.")
+
+        # Determine country from attributes or context
+        country = base.get("country", "US")
+        if location:
+            country = location
+
+        result = {
+            "bio": bio,
+            "persona": persona[:2000],
+            "age": attrs.get("age", base.get("age", 30)),
+            "gender": attrs.get("gender", base.get("gender", "other")),
+            "mbti": attrs.get("mbti", base.get("mbti", random.choice(self.MBTI_TYPES))),
+            "country": country,
+            "profession": occupation,
+            "interested_topics": topics,
+        }
+
+        logger.info(f"KB-only profile for {name}: {len(persona)} chars persona, {len(topics)} topics")
+        return result
+
     def _generate_profile_rule_based(
         self,
         entity_name: str,
@@ -916,8 +1025,9 @@ Important:
                         completed_count[0] += 1
                         current = completed_count[0]
 
-                    # Write to file in real time
-                    save_profiles_realtime()
+                    # Write to file periodically (every 5 profiles) to reduce lock contention
+                    if current % 5 == 0 or current == total:
+                        save_profiles_realtime()
 
                     if progress_callback:
                         progress_callback(

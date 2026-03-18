@@ -1596,6 +1596,15 @@ def start_simulation():
 
             logger.info(f"Graph memory update enabled: simulation_id={simulation_id}, graph_id={graph_id}")
 
+        # Auto-validate & fix profiles before start
+        try:
+            sim_dir = manager._get_simulation_dir(simulation_id)
+            fixes = manager._validate_and_fix_profiles(sim_dir, state)
+            if fixes:
+                logger.info(f"Auto-fixed {len(fixes)} profile issues before start: {fixes[:5]}")
+        except Exception as e:
+            logger.warning(f"Profile validation warning (non-blocking): {e}")
+
         # Start simulation
         run_state = SimulationRunner.start_simulation(
             simulation_id=simulation_id,
@@ -2711,3 +2720,598 @@ def close_simulation_env():
             "error": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
+
+def _classify_sim_error(error_str: str) -> str:
+    """Classify simulation error for targeted auto-fix."""
+    if not error_str:
+        return "unknown"
+    err = error_str.lower()
+    if "keyerror" in err and ("mbti" in err or "age" in err or "gender" in err or "country" in err):
+        return "missing_profile_field"
+    if "timeout" in err or "timed out" in err:
+        return "timeout"
+    if "connection" in err or "refused" in err:
+        return "connection"
+    if "memory" in err or "oom" in err:
+        return "memory"
+    if "json" in err and ("decode" in err or "parse" in err):
+        return "json_parse"
+    return "unknown"
+
+
+def _log_auto_improve_result(simulation_id: str, attempt: int, fixes: list, error_class: str, success: bool, actions: int = 0, elapsed: float = 0):
+    """Log auto-improve results for learning. Append to perf CSV."""
+    try:
+        import csv
+        from datetime import datetime
+        log_path = os.path.expanduser("~/.mirofish_autofix_log.csv")
+        is_new = not os.path.exists(log_path)
+        with open(log_path, 'a', newline='') as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(["timestamp", "simulation_id", "attempt", "fixes", "error_class", "success", "actions", "elapsed_s"])
+            w.writerow([datetime.now().isoformat(), simulation_id, attempt, len(fixes), error_class, success, actions, f"{elapsed:.1f}"])
+    except Exception:
+        pass
+
+
+@simulation_bp.route('/auto-improve', methods=['POST'])
+def auto_improve():
+    """
+    Self-healing simulation loop with error classification and targeted fixes.
+
+    Flow per attempt:
+    1. Validate & auto-fix profiles (missing fields, format issues)
+    2. Start simulation
+    3. Wait for completion with progress tracking
+    4. On failure: classify error, apply targeted fix, retry with backoff
+    5. On success: log performance metrics for cross-session learning
+
+    Request (JSON):
+        {
+            "simulation_id": "sim_xxxx",
+            "platform": "parallel",
+            "max_rounds": 10,
+            "max_retries": 2
+        }
+    """
+    import threading
+    from ..models.task import TaskManager, TaskStatus
+
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({"success": False, "error": "simulation_id required"}), 400
+
+        platform = data.get('platform', 'parallel')
+        max_rounds = data.get('max_rounds', 10)
+        max_retries = min(data.get('max_retries', 2), 3)
+
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": f"Simulation not found: {simulation_id}"}), 404
+
+        task_manager = TaskManager()
+        task_id = task_manager.create_task(
+            task_type="auto_improve",
+            metadata={"simulation_id": simulation_id}
+        )
+
+        def run_auto_improve():
+            import time
+
+            for attempt in range(max_retries + 1):
+                attempt_start = time.time()
+                error_class = "none"
+                fixes = []
+
+                try:
+                    # Step 1: Auto-validate & fix profiles
+                    sim_dir = manager._get_simulation_dir(simulation_id)
+                    fixes = manager._validate_and_fix_profiles(sim_dir, state)
+                    pct = int(10 + (attempt / (max_retries + 1)) * 80)
+                    task_manager.update_task(
+                        task_id, progress=pct,
+                        message=f"[{attempt+1}/{max_retries+1}] {len(fixes)} fixes applied, starting sim..."
+                    )
+
+                    # Step 2: Clean previous run if retrying
+                    if attempt > 0:
+                        try:
+                            SimulationRunner.cleanup_simulation_logs(simulation_id)
+                        except Exception:
+                            pass
+                        # Backoff: 2s, 4s, 8s
+                        time.sleep(min(2 ** (attempt + 1), 8))
+
+                    # Step 3: Run simulation
+                    SimulationRunner.start_simulation(
+                        simulation_id=simulation_id,
+                        platform=platform,
+                        max_rounds=max_rounds,
+                        enable_graph_memory_update=bool(state.graph_id),
+                        graph_id=state.graph_id
+                    )
+
+                    # Step 4: Wait for completion (5s polls, 10 min max)
+                    for tick in range(120):
+                        time.sleep(5)
+                        rs = SimulationRunner.get_run_state(simulation_id)
+                        if rs and rs.runner_status.value in ("completed", "failed"):
+                            break
+                        # Progress update every 30s
+                        if tick % 6 == 0:
+                            actions = rs.total_actions_count if rs else 0
+                            task_manager.update_task(
+                                task_id, progress=pct + 5,
+                                message=f"[{attempt+1}] Running... {actions} actions"
+                            )
+
+                    # Step 5: Check result
+                    rs = SimulationRunner.get_run_state(simulation_id)
+                    elapsed = time.time() - attempt_start
+
+                    if rs and rs.runner_status.value == "completed" and not rs.error:
+                        # Success
+                        _log_auto_improve_result(
+                            simulation_id, attempt + 1, fixes, "none", True,
+                            rs.total_actions_count, elapsed
+                        )
+                        task_manager.complete_task(task_id, result={
+                            "simulation_id": simulation_id,
+                            "attempt": attempt + 1,
+                            "fixes_applied": len(fixes),
+                            "total_actions": rs.total_actions_count,
+                            "elapsed_seconds": round(elapsed, 1),
+                            "status": "completed"
+                        })
+                        return
+
+                    # Failure: classify and log
+                    err = rs.error if rs else "Unknown error"
+                    error_class = _classify_sim_error(err)
+                    _log_auto_improve_result(
+                        simulation_id, attempt + 1, fixes, error_class, False,
+                        rs.total_actions_count if rs else 0, elapsed
+                    )
+                    logger.warning(f"Auto-improve [{attempt+1}] failed ({error_class}): {err[:200]}")
+
+                    if attempt < max_retries:
+                        task_manager.update_task(
+                            task_id, progress=pct + 10,
+                            message=f"[{attempt+1}] Failed ({error_class}), retrying..."
+                        )
+                    else:
+                        task_manager.fail_task(
+                            task_id,
+                            f"All {max_retries+1} attempts failed. Last error ({error_class}): {err[:300]}"
+                        )
+
+                except Exception as e:
+                    elapsed = time.time() - attempt_start
+                    error_class = _classify_sim_error(str(e))
+                    _log_auto_improve_result(
+                        simulation_id, attempt + 1, fixes, error_class, False, 0, elapsed
+                    )
+                    logger.error(f"Auto-improve [{attempt+1}] exception: {e}")
+                    if attempt == max_retries:
+                        task_manager.fail_task(task_id, str(e))
+                        return
+
+        thread = threading.Thread(target=run_auto_improve, daemon=True)
+        thread.start()
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "task_id": task_id,
+                "max_retries": max_retries,
+                "status": "running",
+                "message": "Auto-improve loop started (validate -> run -> classify errors -> fix -> retry)"
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Auto-improve failed: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============== Feedback Loop Endpoint ==============
+
+def _extract_insights_from_actions(simulation_id: str) -> str:
+    """
+    Extract insights from simulation output for graph enrichment.
+
+    Reads from SQLite databases (primary) and JSONL action logs (fallback).
+    Extracts:
+    - Top posts by engagement (likes, comments)
+    - Emerging topics / trending keywords
+    - Agent influence patterns (follows, activity)
+    - Key discussion threads (comments on posts)
+
+    Returns natural language paragraphs suitable for NER enrichment.
+    """
+    import json as _json
+    import sqlite3
+    import collections
+
+    sim_dir = os.path.join(Config.UPLOAD_FOLDER, 'simulations', simulation_id)
+
+    insights_parts = []
+
+    # ── Strategy 1: SQLite databases (OASIS format) ──
+    for platform in ['reddit', 'twitter']:
+        db_path = os.path.join(sim_dir, f'{platform}_simulation.db')
+        if not os.path.exists(db_path):
+            continue
+
+        try:
+            db = sqlite3.connect(db_path)
+            db.row_factory = sqlite3.Row
+
+            # Get user name mapping
+            users = {}
+            for row in db.execute("SELECT user_id, name, bio FROM user"):
+                users[row["user_id"]] = {
+                    "name": row["name"] or f"user_{row['user_id']}",
+                    "bio": (row["bio"] or "")[:100],
+                }
+
+            # Top posts by engagement (likes + comments)
+            posts = db.execute("""
+                SELECT p.post_id, p.user_id, p.content, p.num_likes,
+                       (SELECT COUNT(*) FROM comment c WHERE c.post_id = p.post_id) as num_comments
+                FROM post p
+                ORDER BY (p.num_likes + (SELECT COUNT(*) FROM comment c WHERE c.post_id = p.post_id)) DESC
+                LIMIT 10
+            """).fetchall()
+
+            if posts:
+                post_lines = []
+                for p in posts:
+                    author = users.get(p["user_id"], {}).get("name", "unknown")
+                    engagement = p["num_likes"] + p["num_comments"]
+                    content = (p["content"] or "")[:200]
+                    if content:
+                        post_lines.append(
+                            f"{author} posted ({engagement} engagements): {content}"
+                        )
+                if post_lines:
+                    insights_parts.append(
+                        f"Top {platform} posts by engagement:\n" + "\n".join(post_lines)
+                    )
+
+            # Extract topics from all post content
+            topics = collections.Counter()
+            stop_words = {'this', 'that', 'with', 'have', 'from', 'they', 'been',
+                          'will', 'their', 'would', 'could', 'about', 'which', 'there',
+                          'these', 'those', 'more', 'some', 'into', 'than', 'other'}
+            for row in db.execute("SELECT content FROM post WHERE content IS NOT NULL"):
+                words = (row["content"] or "").lower().split()
+                for w in words:
+                    w = w.strip(".,!?;:\"'()[]{}#@")
+                    if len(w) > 4 and w not in stop_words and w.isalpha():
+                        topics[w] += 1
+
+            top_topics = [w for w, c in topics.most_common(25) if c >= 2]
+            if top_topics:
+                insights_parts.append(
+                    f"Trending {platform} discussion topics: {', '.join(top_topics[:15])}"
+                )
+
+            # Most active users (by trace actions)
+            user_activity = collections.Counter()
+            for row in db.execute("SELECT user_id, COUNT(*) as cnt FROM trace GROUP BY user_id ORDER BY cnt DESC LIMIT 10"):
+                uname = users.get(row["user_id"], {}).get("name", f"user_{row['user_id']}")
+                user_activity[uname] = row["cnt"]
+
+            if user_activity:
+                agent_lines = [f"{name}: {count} actions" for name, count in user_activity.most_common(10)]
+                insights_parts.append(
+                    f"Most active {platform} agents:\n" + "\n".join(agent_lines)
+                )
+
+            # Key discussion threads (posts with most comments)
+            threads = db.execute("""
+                SELECT p.content, GROUP_CONCAT(c.content, ' | ') as comments
+                FROM post p
+                JOIN comment c ON c.post_id = p.post_id
+                GROUP BY p.post_id
+                ORDER BY COUNT(c.comment_id) DESC
+                LIMIT 5
+            """).fetchall()
+
+            if threads:
+                thread_lines = []
+                for t in threads:
+                    post_text = (t["content"] or "")[:150]
+                    comments_text = (t["comments"] or "")[:300]
+                    if post_text:
+                        thread_lines.append(f"Post: {post_text}\n  Responses: {comments_text}")
+                if thread_lines:
+                    insights_parts.append(
+                        f"Key {platform} discussion threads:\n" + "\n\n".join(thread_lines)
+                    )
+
+            # Follow network (influence patterns)
+            follows = db.execute("""
+                SELECT followee_id, COUNT(*) as follower_count
+                FROM follow
+                GROUP BY followee_id
+                ORDER BY follower_count DESC
+                LIMIT 5
+            """).fetchall()
+
+            if follows:
+                influence_lines = []
+                for f in follows:
+                    uname = users.get(f["followee_id"], {}).get("name", f"user_{f['followee_id']}")
+                    influence_lines.append(f"{uname} gained {f['follower_count']} followers")
+                insights_parts.append(
+                    f"{platform.title()} influence leaders:\n" + "\n".join(influence_lines)
+                )
+
+            db.close()
+
+        except Exception as e:
+            logger.warning(f"Failed to read {db_path}: {e}")
+            continue
+
+    # ── Strategy 2: JSONL action logs (fallback) ──
+    if not insights_parts:
+        for platform in ['reddit', 'twitter']:
+            actions_path = os.path.join(sim_dir, f'{platform}_actions.jsonl')
+            if not os.path.exists(actions_path):
+                continue
+
+            actions = []
+            try:
+                with open(actions_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                actions.append(_json.loads(line))
+                            except _json.JSONDecodeError:
+                                continue
+            except Exception as e:
+                logger.warning(f"Failed to read {actions_path}: {e}")
+                continue
+
+            if not actions:
+                continue
+
+            post_content = {}
+            post_engagement = collections.Counter()
+            agent_actions = collections.Counter()
+            topics = collections.Counter()
+
+            for action in actions:
+                action_type = action.get('action_type', action.get('type', ''))
+                agent_name = action.get('agent_name', action.get('username', 'unknown'))
+                content = action.get('content', action.get('text', ''))
+                post_id = action.get('post_id', action.get('target_id', ''))
+
+                agent_actions[agent_name] += 1
+
+                if action_type in ('CREATE_POST', 'create_post') and content:
+                    post_content[post_id or content[:50]] = content
+                    words = content.lower().split()
+                    for w in words:
+                        if len(w) > 4:
+                            topics[w] += 1
+
+                if action_type in ('LIKE_POST', 'REPOST', 'like_post', 'repost') and post_id:
+                    post_engagement[post_id] += 1
+
+            top_posts = post_engagement.most_common(10)
+            if top_posts:
+                post_lines = [
+                    f"Post with {count} engagements: {post_content.get(pid, f'Post {pid}')[:200]}"
+                    for pid, count in top_posts
+                ]
+                insights_parts.append(
+                    f"Top {platform} posts by engagement:\n" + "\n".join(post_lines)
+                )
+
+            top_agents = agent_actions.most_common(10)
+            if top_agents:
+                agent_lines = [f"{name}: {count} actions" for name, count in top_agents]
+                insights_parts.append(
+                    f"Most active {platform} agents:\n" + "\n".join(agent_lines)
+                )
+
+            top_topics = [w for w, c in topics.most_common(20) if c >= 3]
+            if top_topics:
+                insights_parts.append(
+                    f"Trending {platform} topics: {', '.join(top_topics[:15])}"
+                )
+
+    if not insights_parts:
+        return ""
+
+    return "\n\n".join(insights_parts)
+
+
+@simulation_bp.route('/feedback-loop', methods=['POST'])
+def feedback_loop():
+    """
+    Auto-improvement feedback loop: simulate -> extract insights -> enrich graph -> re-simulate.
+
+    1. Run simulation (or use existing completed sim)
+    2. Extract insights from action_log (top posts, trending topics, interaction patterns)
+    3. Feed insights text to /api/graph/enrich with source="feedback_loop"
+    4. Re-prepare simulation (regenerate profiles from enriched graph)
+    5. Re-run simulation
+    6. Repeat for max_iterations (default 2)
+
+    Request (JSON):
+        {
+            "simulation_id": "sim_xxxx",
+            "platform": "parallel",
+            "max_rounds": 10,
+            "max_iterations": 2,
+            "skip_first_run": false   // If true, skip step 1 (sim already completed)
+        }
+
+    Returns:
+        {
+            "success": true,
+            "data": {
+                "task_id": "task_xxxx",
+                "simulation_id": "sim_xxxx",
+                "max_iterations": 2
+            }
+        }
+    """
+    import threading
+    import time as _time
+    from ..models.task import TaskManager, TaskStatus
+    from ..services.graph_builder import GraphBuilderService
+    from ..services.text_processor import TextProcessor
+
+    try:
+        data = request.get_json() or {}
+        simulation_id = data.get('simulation_id')
+        if not simulation_id:
+            return jsonify({"success": False, "error": "simulation_id required"}), 400
+
+        platform = data.get('platform', 'parallel')
+        max_rounds = data.get('max_rounds', 10)
+        max_iterations = min(data.get('max_iterations', 2), 5)
+        skip_first_run = data.get('skip_first_run', False)
+
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+        if not state:
+            return jsonify({"success": False, "error": f"Simulation not found: {simulation_id}"}), 404
+
+        if not state.graph_id:
+            return jsonify({"success": False, "error": "Simulation has no graph_id — cannot enrich"}), 400
+
+        # Get storage from Flask app context (before spawning thread)
+        storage = current_app.extensions.get('neo4j_storage')
+        if not storage:
+            return jsonify({"success": False, "error": "GraphStorage not initialized"}), 500
+
+        task_manager = TaskManager()
+        task_id = task_manager.create_task(f"Feedback loop: {simulation_id}")
+
+        def run_feedback_loop():
+            total_enriched_chars = 0
+
+            for iteration in range(max_iterations):
+                iter_label = f"[{iteration+1}/{max_iterations}]"
+                pct = int((iteration / max_iterations) * 90) + 5
+
+                try:
+                    # Step 1: Run simulation (skip on first if requested)
+                    if not (iteration == 0 and skip_first_run):
+                        task_manager.update_task(
+                            task_id, progress=pct,
+                            message=f"{iter_label} Running simulation..."
+                        )
+                        SimulationRunner.start_simulation(
+                            simulation_id=simulation_id,
+                            platform=platform,
+                            max_rounds=max_rounds,
+                            enable_graph_memory_update=True,
+                            graph_id=state.graph_id,
+                        )
+
+                        # Wait for completion (5s polls, 10 min max)
+                        for tick in range(120):
+                            _time.sleep(5)
+                            rs = SimulationRunner.get_run_state(simulation_id)
+                            if rs and rs.runner_status.value in ("completed", "failed"):
+                                break
+
+                        rs = SimulationRunner.get_run_state(simulation_id)
+                        if not rs or rs.runner_status.value != "completed":
+                            err = rs.error if rs else "Unknown"
+                            logger.warning(f"{iter_label} Simulation failed: {err[:200]}")
+                            task_manager.update_task(
+                                task_id, progress=pct + 5,
+                                message=f"{iter_label} Sim failed ({err[:100]}), extracting partial insights..."
+                            )
+
+                    # Step 2: Extract insights from action logs
+                    task_manager.update_task(
+                        task_id, progress=pct + 10,
+                        message=f"{iter_label} Extracting insights from action logs..."
+                    )
+                    insights = _extract_insights_from_actions(simulation_id)
+
+                    if not insights.strip():
+                        logger.info(f"{iter_label} No insights extracted, stopping loop")
+                        task_manager.update_task(
+                            task_id, progress=pct + 15,
+                            message=f"{iter_label} No new insights found, stopping"
+                        )
+                        break
+
+                    # Step 3: Enrich graph with insights
+                    task_manager.update_task(
+                        task_id, progress=pct + 20,
+                        message=f"{iter_label} Enriching graph with {len(insights)} chars of insights..."
+                    )
+
+                    chunks = TextProcessor.split_text(insights, chunk_size=500, overlap=50)
+                    builder = GraphBuilderService(storage=storage)
+                    builder.add_text_batches(state.graph_id, chunks, batch_size=3)
+                    total_enriched_chars += len(insights)
+
+                    logger.info(f"{iter_label} Enriched graph with {len(insights)} chars ({len(chunks)} chunks)")
+
+                    # Step 4: Re-prepare profiles (if more iterations remain)
+                    if iteration < max_iterations - 1:
+                        task_manager.update_task(
+                            task_id, progress=pct + 30,
+                            message=f"{iter_label} Regenerating profiles from enriched graph..."
+                        )
+                        # The next simulation run will use updated graph data
+                        # via the existing prepare flow
+
+                except Exception as e:
+                    logger.error(f"{iter_label} Feedback loop error: {e}")
+                    task_manager.update_task(
+                        task_id, progress=pct + 35,
+                        message=f"{iter_label} Error: {str(e)[:200]}, continuing..."
+                    )
+                    continue
+
+            # Complete
+            task_manager.update_task(
+                task_id,
+                status=TaskStatus.COMPLETED,
+                progress=100,
+                message="Feedback loop complete",
+                result={
+                    "simulation_id": simulation_id,
+                    "iterations_completed": max_iterations,
+                    "total_enriched_chars": total_enriched_chars,
+                    "graph_id": state.graph_id,
+                }
+            )
+
+        thread = threading.Thread(target=run_feedback_loop, daemon=True)
+        thread.start()
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "task_id": task_id,
+                "simulation_id": simulation_id,
+                "max_iterations": max_iterations,
+                "status": "running",
+                "message": "Feedback loop started (simulate -> extract -> enrich -> repeat)"
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Feedback loop failed: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500

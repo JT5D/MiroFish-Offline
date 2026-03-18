@@ -885,7 +885,8 @@ class ReportAgent:
         simulation_id: str,
         simulation_requirement: str,
         llm_client: Optional[LLMClient] = None,
-        graph_tools: Optional[GraphToolsService] = None
+        graph_tools: Optional[GraphToolsService] = None,
+        cancel_event=None
     ):
         """
         Initialize Report Agent
@@ -896,12 +897,19 @@ class ReportAgent:
             simulation_requirement: Simulation requirement description
             llm_client: LLM client (optional)
             graph_tools: Graph tools service (optional, requires external GraphStorage injection)
+            cancel_event: threading.Event to check for cancellation
         """
         self.graph_id = graph_id
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
+        self._cancel_event = cancel_event
 
-        self.llm = llm_client or LLMClient()
+        # Wall-clock timeout per LLM call. Must be long enough for outline
+        # 120s timeout: qwen2.5:14b generates ~15-30 tok/s on Apple Silicon,
+        # needs ~60-90s for complex ReACT prompts. 60s was too aggressive
+        # (truncated JSON, partial responses). 120s gives headroom while
+        # still catching true stalls.
+        self.llm = llm_client or LLMClient(timeout=60.0, task_type="report")
         if graph_tools is None:
             raise ValueError(
                 "graph_tools (GraphToolsService) is required. "
@@ -1009,7 +1017,22 @@ class ReportAgent:
                 return result.to_text()
 
             elif tool_name == "interview_agents":
-                # Deep interview - call real OASIS interview API to get simulation Agent responses (dual platform)
+                # Quick check: is the simulation environment still running?
+                # If not, return immediately instead of spending 60s+ on
+                # LLM calls for agent selection/question generation that
+                # will ultimately fail at the API call.
+                from ..services.simulation_runner import SimulationRunner
+                try:
+                    sim_dir = os.path.join(SimulationRunner.RUN_STATE_DIR, self.simulation_id)
+                    if not os.path.exists(sim_dir):
+                        return "[Interview unavailable] Simulation environment is not running. Use other tools (insight_forge, panorama_search, quick_search) to gather information from the knowledge graph instead."
+                    from ..services.simulation_runner import SimulationIPCClient
+                    ipc = SimulationIPCClient(sim_dir)
+                    if not ipc.check_env_alive():
+                        return "[Interview unavailable] Simulation environment is not running. Use other tools (insight_forge, panorama_search, quick_search) to gather information from the knowledge graph instead."
+                except Exception:
+                    pass  # Fall through to normal execution
+
                 interview_topic = parameters.get("interview_topic", parameters.get("query", ""))
                 max_agents = parameters.get("max_agents", 5)
                 if isinstance(max_agents, str):
@@ -1287,15 +1310,31 @@ class ReportAgent:
         # ReACT loop
         tool_calls_count = 0
         max_iterations = 5  # Maximum iteration rounds
-        min_tool_calls = 3  # Minimum tool call count
+        min_tool_calls = 2  # Minimum tool call count (reduced from 3 for speed)
         conflict_retries = 0  # Consecutive conflict count for tool call + Final Answer appearing together
+        consecutive_empty = 0  # Stall detection: consecutive empty/None responses
         used_tools = set()  # Record tools that have been called
         all_tools = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
 
         # Report context for InsightForge sub-question generation
         report_context = f"Section title: {section.title}\nSimulation requirement: {self.simulation_requirement}"
 
+        import time as _time
+        section_start = _time.time()
+        SECTION_TIMEOUT = 180  # 3 min max per section
+
         for iteration in range(max_iterations):
+            # Cancellation check (new report requested)
+            if self._cancel_event and self._cancel_event.is_set():
+                logger.warning(f"Section {section.title} cancelled by new report request")
+                return "(Section generation cancelled)"
+
+            # Stall detection: timeout
+            elapsed = _time.time() - section_start
+            if elapsed > SECTION_TIMEOUT:
+                logger.warning(f"Section {section.title} timed out after {elapsed:.0f}s, forcing completion")
+                break
+
             if progress_callback:
                 progress_callback(
                     "generating",
@@ -1303,23 +1342,28 @@ class ReportAgent:
                     f"Deep retrieval and writing ({tool_calls_count}/{self.MAX_TOOL_CALLS_PER_SECTION})"
                 )
 
-            # Call LLM
+            # Call LLM (2048 tokens is sufficient for ReACT thought+action;
+            # 4096 was causing slow 60s+ generations on qwen2.5:14b)
             response = self.llm.chat(
                 messages=messages,
                 temperature=0.5,
-                max_tokens=4096
+                max_tokens=2048
             )
 
-            # Check if LLM returned None (API exception or empty content)
+            # Stall detection: consecutive empty responses
             if response is None:
-                logger.warning(f"Section {section.title} iteration {iteration + 1}: LLM returned None")
-                # If there are remaining iterations, add message and retry
+                consecutive_empty += 1
+                logger.warning(f"Section {section.title} iteration {iteration + 1}: LLM returned None (stall count: {consecutive_empty})")
+                if consecutive_empty >= 2:
+                    logger.warning(f"Section {section.title}: stall detected ({consecutive_empty} consecutive empty responses), breaking")
+                    break
                 if iteration < max_iterations - 1:
                     messages.append({"role": "assistant", "content": "(empty response)"})
                     messages.append({"role": "user", "content": "Please continue generating content."})
                     continue
-                # Last iteration also returned None, break out of loop for forced completion
                 break
+            else:
+                consecutive_empty = 0  # Reset stall counter on valid response
 
             logger.debug(f"LLM response: {response[:200]}...")
 
@@ -1457,12 +1501,19 @@ class ReportAgent:
                 if unused_tools and tool_calls_count < self.MAX_TOOL_CALLS_PER_SECTION:
                     unused_hint = REACT_UNUSED_TOOLS_HINT.format(unused_list=", ".join(unused_tools))
 
+                # Truncate tool results to keep accumulated context manageable.
+                # Large context → slow LLM generation → apparent stalls.
+                MAX_RESULT_CHARS = 3000
+                truncated_result = result[:MAX_RESULT_CHARS]
+                if len(result) > MAX_RESULT_CHARS:
+                    truncated_result += f"\n... (truncated, {len(result)} chars total)"
+
                 messages.append({"role": "assistant", "content": response})
                 messages.append({
                     "role": "user",
                     "content": REACT_OBSERVATION_TEMPLATE.format(
                         tool_name=call["name"],
-                        result=result,
+                        result=truncated_result,
                         tool_calls_count=tool_calls_count,
                         max_tool_calls=self.MAX_TOOL_CALLS_PER_SECTION,
                         used_tools_str=", ".join(used_tools),
@@ -1510,7 +1561,7 @@ class ReportAgent:
         response = self.llm.chat(
             messages=messages,
             temperature=0.5,
-            max_tokens=4096
+            max_tokens=2048
         )
 
         # Check if LLM returned None during forced completion

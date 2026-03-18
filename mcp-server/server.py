@@ -274,6 +274,30 @@ async def mirofish_task_status(task_id: str) -> dict:
 
 
 @mcp.tool()
+async def mirofish_discover_providers(dry_run: bool = False) -> dict:
+    """Auto-discover local LLM providers and configure optimal model routing.
+
+    Scans Ollama, LM Studio, llama.cpp, vLLM, GPT4All, Jan on known ports.
+    Ranks models and assigns them to task types (quality vs throughput).
+    Reloads the LLM router with new assignments.
+
+    Args:
+        dry_run: If True, show what would change without applying.
+    """
+    return await _post(
+        "/api/graph/llm/discover",
+        {"dry_run": dry_run, "reload_router": True},
+        timeout=15.0,
+    )
+
+
+@mcp.tool()
+async def mirofish_llm_status() -> dict:
+    """Get current LLM router status — provider chains, health, and model assignments."""
+    return await _get("/api/graph/llm/status")
+
+
+@mcp.tool()
 async def mirofish_enrich_graph(
     graph_id: str,
     text: str,
@@ -292,6 +316,38 @@ async def mirofish_enrich_graph(
     return await _post(
         "/api/graph/enrich",
         {"graph_id": graph_id, "text": text, "source": source},
+        timeout=60.0,
+    )
+
+
+@mcp.tool()
+async def mirofish_feedback_loop(
+    simulation_id: str,
+    platform: str = "parallel",
+    max_rounds: int = 10,
+    max_iterations: int = 2,
+    skip_first_run: bool = False,
+) -> dict:
+    """Run auto-improvement feedback loop: simulate -> extract insights -> enrich graph -> repeat.
+
+    Returns a task_id — poll with mirofish_task_status.
+
+    Args:
+        simulation_id: Simulation to run the feedback loop on.
+        platform: "twitter", "reddit", or "parallel" (default).
+        max_rounds: Max rounds per simulation run.
+        max_iterations: Number of simulate->enrich cycles (default 2, max 5).
+        skip_first_run: If True, skip initial simulation (use existing results).
+    """
+    return await _post(
+        "/api/simulation/feedback-loop",
+        {
+            "simulation_id": simulation_id,
+            "platform": platform,
+            "max_rounds": max_rounds,
+            "max_iterations": max_iterations,
+            "skip_first_run": skip_first_run,
+        },
         timeout=60.0,
     )
 
@@ -329,6 +385,56 @@ async def mirofish_get_report(simulation_id: str) -> dict:
     except Exception:
         pass
     return resp
+
+
+@mcp.tool()
+async def mirofish_enrich_structured(
+    graph_id: str,
+    entities: list[dict] | None = None,
+    relations: list[dict] | None = None,
+    source: str = "mcp",
+) -> dict:
+    """Inject pre-extracted entities and relations directly into a graph.
+
+    Bypasses NER — use when caller already did entity extraction.
+    Each entity needs at minimum a 'name' field. Relations need 'source' and 'target'.
+
+    Args:
+        graph_id: Graph to enrich.
+        entities: List of {"name": "...", "type": "...", "summary": "..."}.
+        relations: List of {"source": "...", "target": "...", "relation": "...", "fact": "..."}.
+        source: Audit trail label.
+    """
+    body: dict = {"graph_id": graph_id, "source": source}
+    if entities:
+        body["entities"] = entities
+    if relations:
+        body["relations"] = relations
+    return await _post("/api/graph/enrich-structured", body, timeout=30.0)
+
+
+@mcp.tool()
+async def mirofish_cross_search(
+    query: str,
+    graph_ids: list[str],
+    limit: int = 20,
+    scope: str = "edges",
+) -> dict:
+    """Search across multiple knowledge graphs at once.
+
+    Embeds the query once, searches each graph, and re-ranks by score.
+
+    Args:
+        query: Natural language search query.
+        graph_ids: List of graph IDs to search across.
+        limit: Max results (default 20).
+        scope: "edges", "nodes", or "both".
+    """
+    return await _post(
+        "/api/graph/cross-search",
+        {"query": query, "graph_ids": graph_ids, "limit": limit, "scope": scope},
+        timeout=30.0,
+    )
 
 
 @mcp.tool()
