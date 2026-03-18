@@ -114,6 +114,10 @@ def _estimate_model_params(model_id: str) -> Tuple[float, int, bool]:
     if 'coder' in mid or 'code' in mid:
         tier = min(tier + 1, 4)
 
+    # Large context window models (Nemotron, etc.) get tier boost for report tasks
+    if any(kw in mid for kw in ['nemotron', '128k', '131k', 'yarn']):
+        tier = min(tier + 1, 4)
+
     return param_b, tier, False
 
 
@@ -331,6 +335,94 @@ def apply_assignments(assignments: Dict[str, Dict[str, str]], dry_run: bool = Fa
     return changes
 
 
+def suggest_models() -> List[Dict[str, str]]:
+    """
+    Suggest models to download based on current provider capabilities and gaps.
+
+    Analyzes what's available vs what would improve the pipeline, and returns
+    actionable recommendations with download commands.
+    """
+    providers = discover_providers()
+
+    all_models = []
+    for p in providers:
+        for m in p.models:
+            all_models.append(m)
+
+    gen_models = [m for m in all_models if not m.is_embedding]
+    emb_models = [m for m in all_models if m.is_embedding]
+
+    suggestions = []
+
+    # Check for large context window model (reports, complex reasoning)
+    has_large_ctx = any(
+        kw in m.model_id.lower()
+        for m in gen_models
+        for kw in ['nemotron', '128k', '131k', 'long', 'yarn']
+    )
+    if not has_large_ctx:
+        suggestions.append({
+            "model": "nvidia/nemotron-mini:latest",
+            "reason": "Large context window (128K tokens) for report generation and complex multi-section analysis. Handles full simulation transcripts without chunking.",
+            "task": "REPORT",
+            "download": "ollama pull nvidia/nemotron-mini",
+            "priority": "high",
+        })
+
+    # Check for fast small model (throughput)
+    has_fast = any(m.param_b <= 4 and m.param_b > 0 for m in gen_models)
+    if not has_fast:
+        suggestions.append({
+            "model": "qwen2.5:3b",
+            "reason": "Fast 3B model for high-throughput tasks (profile gen batch). 3-5x faster than 14B with acceptable quality for structured output.",
+            "task": "PROFILE_GEN",
+            "download": "ollama pull qwen2.5:3b",
+            "priority": "medium",
+        })
+
+    # Check for coding-specialized model
+    has_coder = any('coder' in m.model_id.lower() or 'code' in m.model_id.lower() for m in gen_models)
+    if not has_coder:
+        suggestions.append({
+            "model": "qwen2.5-coder:14b",
+            "reason": "Code-specialized model for structured JSON output, NER extraction, and ontology generation. Better at following JSON schemas.",
+            "task": "ENRICHMENT, SIM_CONFIG",
+            "download": "ollama pull qwen2.5-coder:14b",
+            "priority": "medium",
+        })
+
+    # Check for embedding model
+    if not emb_models:
+        suggestions.append({
+            "model": "nomic-embed-text",
+            "reason": "Required for graph vector search. 768-dim embeddings, fast and accurate.",
+            "task": "EMBEDDING",
+            "download": "ollama pull nomic-embed-text",
+            "priority": "critical",
+        })
+
+    # Check for high-quality large model (if only small models available)
+    max_param = max((m.param_b for m in gen_models), default=0)
+    if max_param < 10:
+        suggestions.append({
+            "model": "qwen2.5:14b",
+            "reason": "14B parameter model for quality-sensitive tasks. Significant quality improvement over smaller models for reports and analysis.",
+            "task": "REPORT, GRAPH_TOOLS",
+            "download": "ollama pull qwen2.5:14b",
+            "priority": "high",
+        })
+
+    # Always suggest Nemotron if not present (large context is a game-changer for reports)
+    has_nemotron = any('nemotron' in m.model_id.lower() for m in gen_models)
+    if not has_nemotron and has_large_ctx:
+        pass  # Already have a large-ctx model
+    elif not has_nemotron:
+        # Already added above in large_ctx check
+        pass
+
+    return suggestions
+
+
 def discover_and_configure(dry_run: bool = False) -> Dict:
     """
     Full discovery + configuration pipeline.
@@ -354,6 +446,9 @@ def discover_and_configure(dry_run: bool = False) -> Dict:
 
     assignments = choose_best_assignment(providers)
     changes = apply_assignments(assignments, dry_run=dry_run)
+
+    # Generate model suggestions
+    suggestions = suggest_models()
 
     summary = {
         "providers": [
@@ -381,6 +476,7 @@ def discover_and_configure(dry_run: bool = False) -> Dict:
             }
             for prefix, c in assignments.items()
         },
+        "suggestions": suggestions,
         "changes": changes,
         "dry_run": dry_run,
     }
