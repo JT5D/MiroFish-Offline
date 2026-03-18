@@ -2855,6 +2855,21 @@ def auto_improve():
                     elapsed = time.time() - attempt_start
 
                     if rs and rs.runner_status.value == "completed" and not rs.error:
+                        # Log to benchmark
+                        try:
+                            from ..utils.benchmark import get_bench
+                            get_bench().log_sim_run(
+                                simulation_id=simulation_id,
+                                platform="parallel",
+                                total_rounds=rs.total_rounds or 0,
+                                total_actions=rs.total_actions_count or 0,
+                                twitter_actions=rs.twitter_actions_count or 0,
+                                reddit_actions=rs.reddit_actions_count or 0,
+                                duration_s=elapsed,
+                                entities_count=getattr(rs, 'entities_count', 0) or 0,
+                            )
+                        except Exception:
+                            pass
                         # Success
                         _log_auto_improve_result(
                             simulation_id, attempt + 1, fixes, "none", True,

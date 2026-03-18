@@ -459,5 +459,45 @@ async def mirofish_graph_search(
     )
 
 
+@mcp.tool()
+async def mirofish_system_status() -> dict:
+    """Get system performance status — LLM perf metrics, bottlenecks, dynamic config, and recommendations."""
+    return await _get("/api/system/status")
+
+
+@mcp.tool()
+async def mirofish_benchmark(
+    view: str = "leaderboard",
+    task_type: str | None = None,
+    model_a: str | None = None,
+    model_b: str | None = None,
+    hours: int = 24,
+) -> dict:
+    """Query persistent benchmark data — model leaderboards, sim rankings, trends, comparisons.
+
+    Args:
+        view: One of "leaderboard", "sims", "trends", "compare", "summary".
+        task_type: Filter leaderboard by task type (e.g. "report", "profile").
+        model_a: First model for comparison (requires view="compare").
+        model_b: Second model for comparison (requires view="compare").
+        hours: Lookback period for trends (default 24).
+    """
+    if view == "leaderboard":
+        params = {}
+        if task_type:
+            params["task_type"] = task_type
+        return await _get("/api/benchmark/leaderboard", params=params)
+    elif view == "sims":
+        return await _get("/api/benchmark/sims")
+    elif view == "trends":
+        return await _get("/api/benchmark/trends", params={"hours": hours})
+    elif view == "compare" and model_a and model_b:
+        return await _get("/api/benchmark/compare", params={"model_a": model_a, "model_b": model_b})
+    elif view == "summary":
+        return await _get("/api/benchmark/summary")
+    else:
+        return {"error": f"Unknown view '{view}'. Use: leaderboard, sims, trends, compare, summary"}
+
+
 if __name__ == "__main__":
     mcp.run()

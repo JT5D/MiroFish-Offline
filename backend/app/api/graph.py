@@ -988,11 +988,25 @@ def llm_status():
     try:
         from ..utils.llm_router import get_router
         router = get_router()
+        # Include perf tracker data
+        perf_data = {}
+        try:
+            from ..utils.llm_perf_tracker import get_tracker
+            tracker = get_tracker()
+            perf_data = {
+                "summary": tracker.get_summary(),
+                "bottlenecks": tracker.get_bottlenecks(),
+                "recommendations": tracker.get_recommendations(),
+            }
+        except Exception:
+            pass
+
         return jsonify({
             "success": True,
             "data": {
                 "chains": router.get_chains(),
                 "health": router.get_status(),
+                "performance": perf_data,
             }
         })
     except Exception as e:

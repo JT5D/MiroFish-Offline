@@ -80,10 +80,103 @@ def create_app(config_class=Config):
     app.register_blueprint(simulation_bp, url_prefix='/api/simulation')
     app.register_blueprint(report_bp, url_prefix='/api/report')
 
+    # Auto-discover LLM providers and configure routing on startup (background, non-blocking)
+    def _startup_discovery():
+        try:
+            from .utils.llm_discovery import discover_and_configure
+            result = discover_and_configure()
+            prov_count = len(result.get('providers', []))
+            change_count = len(result.get('changes', {}))
+            if prov_count > 0:
+                logger.info(f"Auto-discovery: {prov_count} providers, {change_count} env vars configured")
+                # Reload router with new env vars
+                from .utils.llm_router import get_router
+                router = get_router()
+                router._build_chains()
+                logger.info("LLM router reloaded with discovered providers")
+            suggestions = result.get('suggestions', [])
+            if suggestions:
+                logger.info(f"Model suggestions ({len(suggestions)}):")
+                for s in suggestions[:3]:
+                    logger.info(f"  [{s.get('priority','')}] {s.get('model','')}: {s.get('reason','')[:80]}")
+        except Exception as e:
+            logger.debug(f"Auto-discovery skipped: {e}")
+
+    import threading
+    threading.Thread(target=_startup_discovery, daemon=True).start()
+
+    # Initialize dynamic config (system resource check)
+    try:
+        from .utils.dynamic_config import get_dynamic_config
+        dconf = get_dynamic_config()
+        if should_log_startup:
+            logger.info(
+                f"Dynamic config: workers={dconf.profile_gen_workers}, "
+                f"mem={dconf.available_memory_gb:.1f}GB, pressure={dconf.system_under_pressure}"
+            )
+    except Exception as e:
+        logger.debug(f"Dynamic config init skipped: {e}")
+
     # Health check
     @app.route('/health')
     def health():
         return {'status': 'ok', 'service': 'MiroFish-Offline Backend'}
+
+    # Performance and tuning status endpoint
+    @app.route('/api/system/status')
+    def system_status():
+        result = {'service': 'MiroFish-Offline Backend'}
+        try:
+            from .utils.llm_perf_tracker import get_tracker
+            tracker = get_tracker()
+            result['perf'] = tracker.get_summary()
+            result['bottlenecks'] = tracker.get_bottlenecks()
+        except Exception:
+            pass
+        try:
+            from .utils.dynamic_config import get_dynamic_config
+            dc = get_dynamic_config()
+            result['dynamic_config'] = {
+                'profile_gen_workers': dc.profile_gen_workers,
+                'llm_concurrency': dc.llm_concurrency,
+                'available_memory_gb': round(dc.available_memory_gb, 1),
+                'system_under_pressure': dc.system_under_pressure,
+            }
+        except Exception:
+            pass
+        return result
+
+    # Benchmark endpoints
+    @app.route('/api/benchmark/leaderboard')
+    def benchmark_leaderboard():
+        from .utils.benchmark import get_bench
+        task = request.args.get('task_type')
+        return {'data': get_bench().leaderboard(task_type=task)}
+
+    @app.route('/api/benchmark/sims')
+    def benchmark_sims():
+        from .utils.benchmark import get_bench
+        return {'data': get_bench().sim_leaderboard()}
+
+    @app.route('/api/benchmark/trends')
+    def benchmark_trends():
+        from .utils.benchmark import get_bench
+        hours = int(request.args.get('hours', 24))
+        return {'data': get_bench().trends(hours=hours)}
+
+    @app.route('/api/benchmark/compare')
+    def benchmark_compare():
+        from .utils.benchmark import get_bench
+        a = request.args.get('model_a', '')
+        b = request.args.get('model_b', '')
+        if not a or not b:
+            return {'error': 'Provide model_a and model_b query params'}, 400
+        return {'data': get_bench().model_comparison(a, b)}
+
+    @app.route('/api/benchmark/summary')
+    def benchmark_summary():
+        from .utils.benchmark import get_bench
+        return {'data': get_bench().summary()}
 
     if should_log_startup:
         logger.info("MiroFish-Offline Backend startup complete")

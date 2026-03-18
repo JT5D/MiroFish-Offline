@@ -53,6 +53,8 @@ class LLMClient:
                 base_url = provider.base_url
                 model = provider.model
 
+        self._task_type_label = task_type or 'default'
+
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model = model or Config.LLM_MODEL_NAME
@@ -113,6 +115,10 @@ class LLMClient:
         start = time.monotonic()
         logger.info(f"LLM call: timeout={self._wall_timeout}s max_tokens={max_tokens}")
 
+        # Track task type and provider for perf recording
+        _task_label = getattr(self, '_task_type_label', 'default')
+        _provider_label = self.base_url or 'unknown'
+
         # Shared state between main thread and worker
         chunks = []
         error = [None]
@@ -156,6 +162,36 @@ class LLMClient:
             logger.warning(f"LLM error after {elapsed:.1f}s: {error[0]}")
         else:
             logger.info(f"LLM complete: {len(chunks)} chunks in {elapsed:.1f}s")
+
+        # Record performance metrics (non-blocking, never fails)
+        _success = bool(chunks) and not timed_out
+        _err = type(error[0]).__name__ if error[0] else ""
+        try:
+            from .llm_perf_tracker import get_tracker
+            get_tracker().record_call(
+                task_type=_task_label,
+                provider_name=_provider_label,
+                latency_s=elapsed,
+                success=_success,
+                tokens=len(chunks),
+                error_type=_err,
+            )
+        except Exception:
+            pass
+        try:
+            from .benchmark import get_bench
+            get_bench().log_llm_call(
+                task_type=_task_label,
+                provider=_provider_label,
+                model=self.model or '',
+                latency_s=elapsed,
+                success=_success,
+                tokens=len(chunks),
+                error_type=_err,
+                base_url=self.base_url or '',
+            )
+        except Exception:
+            pass
 
         if not chunks:
             return None
